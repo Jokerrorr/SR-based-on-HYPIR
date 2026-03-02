@@ -114,6 +114,7 @@ class RealESRGANDataset(data.Dataset):
                 elif self.crop_type == "random":
                     image = random_crop_arr(image, self.out_size, min_crop_frac=0.7)
         else:
+            image = image.resize((self.out_size, self.out_size), Image.BILINEAR)
             assert image.height == self.out_size and image.width == self.out_size
             image = np.array(image)
         # hwc, rgb, 0,255, uint8

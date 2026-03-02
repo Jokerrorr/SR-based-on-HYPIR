@@ -1,17 +1,17 @@
-output_dir: TODO
+output_dir: output
 
 data_config:
   train:
-    batch_size: 6
+    batch_size: 1
     dataloader_num_workers: 2
     dataset:
       target: HYPIR.dataset.realesrgan.RealESRGANDataset
       params:
         file_meta:
-          file_list: TODO
-          image_path_prefix: TODO
-          image_path_key: TODO
-          prompt_key: TODO
+          file_list: data/LSDIR/lsdir_hypir.parquet
+          image_path_prefix: ""
+          image_path_key: image_path
+          prompt_key: prompt
         file_backend_cfg:
           target: HYPIR.dataset.file_backend.HardDiskBackend
         out_size: 512
@@ -70,7 +70,7 @@ data_config:
         resize_back: true
 
 base_model_type: sd2
-base_model_path: stabilityai/stable-diffusion-2-1-base
+base_model_path: checkpoints/sd2
 model_t: 200
 coeff_t: 200
 lora_rank: 256
@@ -90,7 +90,7 @@ opt_kwargs:
 
 mixed_precision: bf16
 seed: 231
-max_train_steps: 30000
+max_train_steps: 5000
 gradient_accumulation_steps: 1
 gradient_checkpointing: true
 max_grad_norm: 1.0
@@ -98,7 +98,7 @@ logging_dir: logs
 report_to: tensorboard
 checkpointing_steps: 500
 checkpoints_total_limit: 2
-resume_from_checkpoint: ~
+resume_from_checkpoint: checkpoints/hypir-1
 log_image_steps: 100
 log_grad_steps: 100
 log_grad_modules: [conv_out]
