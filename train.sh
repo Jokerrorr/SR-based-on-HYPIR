@@ -1,0 +1,1 @@
+accelerate launch train.py --config configs/sd2_train.yaml
