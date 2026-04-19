@@ -23,6 +23,13 @@ except ImportError:
     print("Warning: HYPIR enhancer not available. Make sure HYPIR is installed.")
     HYPIR_AVAILABLE = False
 
+# Try to import alignment enhancer
+try:
+    from ..enhancer.sd2_alignment import SD2AlignmentEnhancer
+    ALIGNMENT_AVAILABLE = True
+except ImportError:
+    ALIGNMENT_AVAILABLE = False
+
 
 class RMHYPIRPipeline:
     """
@@ -230,6 +237,15 @@ class RMHYPIRPipeline:
 
         # Run HYPIR enhancement
         with torch.no_grad():
+            # If using alignment enhancer, pass VAE-encoded RM output (x_en)
+            if ALIGNMENT_AVAILABLE and isinstance(self.hypir_model, SD2AlignmentEnhancer):
+                # Encode RM output through VAE to get x_en
+                rm_normalized = (rm_output * 2 - 1).to(
+                    dtype=self.hypir_model.weight_dtype, device=self.hypir_model.device
+                )
+                x_en = self.hypir_model.vae.encode(rm_normalized).latent_dist.sample()
+                self.hypir_model.set_alignment_input(x_en)
+
             hypir_output = self.hypir_model.enhance(
                 lq=rm_output,
                 prompt=prompt,

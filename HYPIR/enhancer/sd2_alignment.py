@@ -1,0 +1,97 @@
+"""
+SD2 Enhancer with alignment module for RM+HYPIR inference.
+
+Extends SD2Enhancer to inject alignment features from x_en
+(VAE Encoder output on RM-restored image) into UNet forward pass.
+
+Alignment input: x_en = VAE.encode(RM(LQ)), latent space [B, 4, H/8, W/8].
+"""
+
+import torch
+from diffusers import DDPMScheduler, UNet2DConditionModel
+from transformers import CLIPTextModel, CLIPTokenizer
+from peft import LoraConfig
+
+from HYPIR.enhancer.base import BaseEnhancer
+from HYPIR.alignment.alignment_handler import AlignmentHandler
+from HYPIR.model.unet_alignment import UNetAlignment
+
+
+class SD2AlignmentEnhancer(BaseEnhancer):
+
+    def init_scheduler(self):
+        self.scheduler = DDPMScheduler.from_pretrained(
+            self.base_model_path, subfolder="scheduler"
+        )
+
+    def init_text_models(self):
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            self.base_model_path, subfolder="tokenizer"
+        )
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            self.base_model_path, subfolder="text_encoder",
+            torch_dtype=self.weight_dtype,
+        ).to(self.device)
+        self.text_encoder.eval().requires_grad_(False)
+
+    def init_generator(self):
+        # Load base UNet
+        unet = UNet2DConditionModel.from_pretrained(
+            self.base_model_path, subfolder="unet",
+            torch_dtype=self.weight_dtype,
+        ).to(self.device)
+
+        # Add LoRA
+        target_modules = self.lora_modules
+        G_lora_cfg = LoraConfig(
+            r=self.lora_rank, lora_alpha=self.lora_rank,
+            init_lora_weights="gaussian", target_modules=target_modules,
+        )
+        unet.add_adapter(G_lora_cfg)
+
+        # Load LoRA weights
+        print(f"Load model weights from {self.weight_path}")
+        state_dict = torch.load(self.weight_path, map_location="cpu", weights_only=False)
+        unet.load_state_dict(state_dict, strict=False)
+
+        # Create alignment handler (latent-space input)
+        handler = AlignmentHandler(unet_conv_channels=320, latent_channels=4)
+
+        # Wrap
+        self.G = UNetAlignment(unet=unet, alignment_handler=handler)
+
+        self.G.eval().requires_grad_(False)
+
+    def prepare_inputs(self, batch_size, prompt):
+        bs = batch_size
+        txt_ids = self.tokenizer(
+            [prompt] * bs,
+            max_length=self.tokenizer.model_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+        text_embed = self.text_encoder(txt_ids.to(self.device))[0]
+        c_txt = {"text_embed": text_embed}
+        timesteps = torch.full((bs,), self.model_t, dtype=torch.long, device=self.device)
+        self.inputs = dict(
+            c_txt=c_txt,
+            timesteps=timesteps,
+        )
+
+    def set_alignment_input(self, x_en: torch.Tensor):
+        """Store VAE-encoded RM output (x_en) for use in forward_generator."""
+        self._x_en = x_en
+
+    def forward_generator(self, z_lq):
+        z_in = z_lq * self.vae.config.scaling_factor
+        x_en = getattr(self, "_x_en", None)
+
+        eps = self.G(
+            z_in, self.inputs["timesteps"],
+            encoder_hidden_states=self.inputs["c_txt"]["text_embed"],
+            x_en=x_en,
+        ).sample
+        z = self.scheduler.step(eps, self.coeff_t, z_in).pred_original_sample
+        z_out = z / self.vae.config.scaling_factor
+        return z_out

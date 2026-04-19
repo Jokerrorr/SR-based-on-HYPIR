@@ -19,3 +19,4 @@ output/
 *.bin
 *.tar
 *.ckpt
+hypir.egg-info/
