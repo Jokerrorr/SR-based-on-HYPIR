@@ -4,7 +4,7 @@ import os
 from tqdm import tqdm
 from PIL import Image
 
-def download_all_images(save_dir="LSDIR_images"):
+def download_all_images():
     """下载LSDIR数据集"""
     
     files = list_repo_files(
