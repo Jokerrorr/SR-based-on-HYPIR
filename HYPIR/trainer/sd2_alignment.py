@@ -115,6 +115,17 @@ class SD2AlignmentTrainer(BaseTrainer):
         )
         unet.add_adapter(G_lora_cfg)
 
+        # Load HYPIR pretrained LoRA weights
+        hypir_pretrained = getattr(self.config, "hypir_pretrained_path", None)
+        if hypir_pretrained is not None and os.path.exists(hypir_pretrained):
+            logger.info(f"Loading HYPIR pretrained LoRA from {hypir_pretrained}")
+            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu")
+            m, u = unet.load_state_dict(pretrained_sd, strict=False)
+            logger.info(f"Loaded HYPIR LoRA: {len(pretrained_sd)} params, "
+                        f"missing: {len(m)}, unexpected: {len(u)}")
+        else:
+            logger.warning("No HYPIR pretrained LoRA found, using random LoRA init")
+
         # Create alignment handler
         alignment_cfg = getattr(self.config, "alignment", None)
         if alignment_cfg is not None:

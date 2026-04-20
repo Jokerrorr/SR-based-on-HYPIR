@@ -1,12 +1,12 @@
 """
 Stage 1 Alignment Pretraining Trainer.
 
-Freezes UNet backbone (no LoRA), only trains Alignment Handler parameters.
+Loads HYPIR pretrained LoRA (frozen), only trains Alignment Handler parameters.
 Uses the same adversarial training framework as SD2AlignmentTrainer,
 but the generator's only learnable components are the alignment module.
 
 Purpose: Let the alignment module learn to extract useful features from
-x_en (VAE-encoded RM output) before jointly training with UNet LoRA.
+x_en (VAE-encoded RM output) based on HYPIR's existing restoration ability.
 
 After Stage 1, save alignment weights for Stage 2 initialization.
 """
@@ -31,21 +31,45 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
-    """Stage 1: Freeze UNet, only train alignment handler."""
+    """Stage 1: Load HYPIR pretrained LoRA (frozen), only train alignment handler."""
 
     def init_generator(self):
-        # Load base UNet (frozen, no LoRA)
+        from peft import LoraConfig
+
+        # Load base UNet
         unet = UNet2DConditionModel.from_pretrained(
             self.config.base_model_path, subfolder="unet",
             torch_dtype=self.weight_dtype,
         ).to(self.device)
-        unet.eval().requires_grad_(False)
 
         if self.config.gradient_checkpointing:
             unet.enable_gradient_checkpointing()
 
-        # No LoRA — UNet is completely frozen
-        logger.info("Stage 1: UNet frozen, no LoRA added")
+        # Add LoRA to UNet (required to load HYPIR pretrained weights)
+        target_modules = self.config.lora_modules
+        logger.info(f"Stage 1: Add lora parameters to {target_modules}")
+        G_lora_cfg = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_rank,
+            init_lora_weights="gaussian",
+            target_modules=target_modules,
+        )
+        unet.add_adapter(G_lora_cfg)
+
+        # Load HYPIR pretrained LoRA weights
+        hypir_pretrained = getattr(self.config, "hypir_pretrained_path", None)
+        if hypir_pretrained is not None and os.path.exists(hypir_pretrained):
+            logger.info(f"Stage 1: Loading HYPIR pretrained LoRA from {hypir_pretrained}")
+            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu")
+            m, u = unet.load_state_dict(pretrained_sd, strict=False)
+            logger.info(f"Stage 1: Loaded HYPIR LoRA: {len(pretrained_sd)} params, "
+                        f"missing: {len(m)}, unexpected: {len(u)}")
+        else:
+            logger.warning("Stage 1: No HYPIR pretrained LoRA found, using random LoRA init")
+
+        # Freeze UNet entirely (including LoRA)
+        unet.eval().requires_grad_(False)
+        logger.info("Stage 1: UNet + LoRA frozen, only alignment handler is trainable")
 
         # Create alignment handler (same as parent)
         alignment_cfg = getattr(self.config, "alignment", None)
@@ -75,9 +99,9 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
             p.data = p.to(torch.float32)
 
         align_params = sum(p.numel() for p in handler.parameters())
+        unet_trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
         logger.info(f"Stage 1: Alignment handler params: {align_params/1e6:.2f}M")
-        logger.info(f"Stage 1: UNet trainable params: "
-                     f"{sum(p.numel() for p in unet.parameters() if p.requires_grad)}")
+        logger.info(f"Stage 1: UNet trainable params: {unet_trainable} (should be 0)")
 
     def init_optimizers(self):
         """Only alignment handler params in G optimizer."""

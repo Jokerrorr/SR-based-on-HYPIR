@@ -1,4 +1,4 @@
-# Stage 1: Alignment pretraining — freeze UNet, only train alignment handler
+# Stage 1: Alignment pretraining — freeze HYPIR pretrained LoRA, only train alignment handler
 # After this stage, alignment weights are loaded into Stage 2 for joint training
 
 output_dir: output_alignment_stage1
@@ -74,8 +74,10 @@ base_model_path: checkpoints/sd2
 model_t: 200
 coeff_t: 200
 
-# No LoRA in Stage 1 — UNet is completely frozen
-# lora_rank and lora_modules are not needed
+# HYPIR pretrained LoRA — loaded then frozen during Stage 1
+hypir_pretrained_path: checkpoints/HYPIR/HYPIR_sd2.pth
+lora_rank: 256
+lora_modules: [to_k, to_q, to_v, to_out.0, conv, conv1, conv2, conv_shortcut, conv_out, proj_in, proj_out, ff.net.2, ff.net.0.proj]
 
 # Alignment module configuration
 alignment:
