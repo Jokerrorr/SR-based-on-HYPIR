@@ -198,7 +198,8 @@ class SD2AlignmentTrainer(BaseTrainer):
         # Collect LoRA params from UNet + alignment handler params
         self.G_params = list(filter(lambda p: p.requires_grad, self.G.parameters()))
         align_params = list(self.G.alignment_handler.parameters())
-        self.G_params.extend([p for p in align_params if p not in self.G_params])
+        existing_ids = {id(p) for p in self.G_params}
+        self.G_params.extend([p for p in align_params if id(p) not in existing_ids])
         logger.info(f"G params: LoRA={sum(1 for p in self.G.unet.parameters() if p.requires_grad)} tensors, "
                      f"Alignment={len(align_params)} tensors")
 
