@@ -356,7 +356,8 @@ class SD2AlignmentTrainer(BaseTrainer):
         with torch.no_grad():
             handler = self.G.alignment_handler
             x_en = self.batch_inputs.x_en[:N]
-            enc_feat = handler.alignment_encoder(x_en)  # [B, 512, H/8, W/8]
+            handler_dtype = next(handler.parameters()).dtype
+            enc_feat = handler.alignment_encoder(x_en.to(dtype=handler_dtype))  # [B, 512, H/8, W/8]
             emb_feat = handler.condition_embedding(enc_feat)  # [B, 320, H/8, W/8]
             unet_sample = self.G.unet.conv_in(
                 self.batch_inputs.z_lq[:N] * self.vae.config.scaling_factor

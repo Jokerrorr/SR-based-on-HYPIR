@@ -86,6 +86,8 @@ class AlignmentHandler(nn.Module):
         Returns:
             Alignment features [B, 320, H/8, W/8].
         """
+        # Cast input to match handler dtype (params are float32, input may be bf16)
+        x_en = x_en.to(dtype=next(self.parameters()).dtype)
         features = self.alignment_encoder(x_en)
         if self.use_condition_embedding:
             features = self.condition_embedding(features)
@@ -104,6 +106,8 @@ class AlignmentHandler(nn.Module):
         Returns:
             Fused sample [B, 320, H/8, W/8].
         """
+        # Cast unet_sample to match alignment handler dtype for concatenation
+        unet_sample = unet_sample.to(dtype=alignment_features.dtype)
         batch_size, channel, height, width = alignment_features.shape
         # Concat along channel dim → [B, 640, H/8, W/8]
         concat_feat = torch.cat([unet_sample, alignment_features], dim=1)
