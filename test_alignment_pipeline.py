@@ -120,9 +120,9 @@ def parse_args():
     parser.add_argument("--lora_rank", type=int, default=256,
                         help="LoRA rank")
     parser.add_argument("--model_t", type=int, default=200,
-                        help="Model input timestep")
+                        help="Timestep for single-step inference")
     parser.add_argument("--coeff_t", type=int, default=200,
-                        help="Timestep for conversion coefficients")
+                        help="Coefficient timestep for original HYPIR (not alignment)")
 
     # --- Input / Output ---
     parser.add_argument("--input", type=str, required=True,
@@ -447,8 +447,6 @@ def test_alignment(args, images, output_dir):
         weight_path=weight_path,
         lora_modules=args.lora_modules.split(","),
         lora_rank=args.lora_rank,
-        model_t=args.model_t,
-        coeff_t=args.coeff_t,
         device=args.device,
     )
     print("Loading models...")
@@ -487,6 +485,7 @@ def test_alignment(args, images, output_dir):
                 target_longest_side=args.target_longest_side,
                 patch_size=args.patch_size,
                 stride=args.stride,
+                model_t=args.model_t,
                 return_type="pil",
             )[0]
         dt = time() - t0
@@ -536,8 +535,6 @@ def test_full(args, images, output_dir):
         weight_path=weight_path,
         lora_modules=args.lora_modules.split(","),
         lora_rank=args.lora_rank,
-        model_t=args.model_t,
-        coeff_t=args.coeff_t,
         device=args.device,
     )
     alignment_model.init_models()
@@ -594,6 +591,7 @@ def test_full(args, images, output_dir):
                 target_longest_side=args.target_longest_side,
                 patch_size=args.patch_size,
                 stride=args.stride,
+                model_t=args.model_t,
                 return_type="pil",
             )[0]
         t_hypir = time() - t_hypir_start

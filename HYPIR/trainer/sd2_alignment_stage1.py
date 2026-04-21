@@ -1,27 +1,24 @@
 """
-Stage 1 Alignment Pretraining Trainer.
+Stage 1 Alignment Pretraining Trainer (FaithDiff-style).
 
 Loads HYPIR pretrained LoRA (frozen), only trains Alignment Handler parameters.
-Uses the same adversarial training framework as SD2AlignmentTrainer,
-but the generator's only learnable components are the alignment module.
+Uses L1 noise prediction loss — same as FaithDiff Stage 1.
 
-Purpose: Let the alignment module learn to extract useful features from
-x_en (VAE-encoded RM output) based on HYPIR's existing restoration ability.
-
-After Stage 1, save alignment weights for Stage 2 initialization.
+Training flow:
+  GT → VAE encode → add_noise(t) → noisy_hq
+  RM(LQ) → VAE encode → x_en → AlignmentHandler → features
+  UNet(noisy_hq, t, text, features) → noise_pred
+  Loss = L1(noise_pred, noise)
 """
 
 import os
-import csv
 import logging
-from typing import List, Dict
 
 import torch
 import torch.nn.functional as F
 from accelerate.logging import get_logger
-from diffusers import DDPMScheduler, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer
-from torchvision.utils import make_grid
+from diffusers import UNet2DConditionModel
+from peft import LoraConfig
 
 from HYPIR.trainer.sd2_alignment import SD2AlignmentTrainer
 from HYPIR.alignment.alignment_handler import AlignmentHandler
@@ -34,8 +31,6 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
     """Stage 1: Load HYPIR pretrained LoRA (frozen), only train alignment handler."""
 
     def init_generator(self):
-        from peft import LoraConfig
-
         # Load base UNet
         unet = UNet2DConditionModel.from_pretrained(
             self.config.base_model_path, subfolder="unet",
@@ -60,10 +55,11 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         hypir_pretrained = getattr(self.config, "hypir_pretrained_path", None)
         if hypir_pretrained is not None and os.path.exists(hypir_pretrained):
             logger.info(f"Stage 1: Loading HYPIR pretrained LoRA from {hypir_pretrained}")
-            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu")
+            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu", weights_only=False)
             m, u = unet.load_state_dict(pretrained_sd, strict=False)
+            loaded_lora = sum(1 for k in unet.state_dict() if "lora" in k)
             logger.info(f"Stage 1: Loaded HYPIR LoRA: {len(pretrained_sd)} params, "
-                        f"missing: {len(m)}, unexpected: {len(u)}")
+                         f"LoRA keys: {loaded_lora}")
         else:
             logger.warning("Stage 1: No HYPIR pretrained LoRA found, using random LoRA init")
 
@@ -71,7 +67,7 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         unet.eval().requires_grad_(False)
         logger.info("Stage 1: UNet + LoRA frozen, only alignment handler is trainable")
 
-        # Create alignment handler (same as parent)
+        # Create alignment handler
         alignment_cfg = getattr(self.config, "alignment", None)
         if alignment_cfg is not None:
             handler_kwargs = dict(
@@ -105,13 +101,13 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
 
     def init_optimizers(self):
         """Only alignment handler params in G optimizer."""
-        logger.info(f"Stage 1: Creating {self.config.optimizer_type} optimizers (alignment only)")
+        logger.info(f"Stage 1: Creating {self.config.optimizer_type} optimizer (alignment only)")
         if self.config.optimizer_type == "adam":
             optimizer_cls = torch.optim.AdamW
         elif self.config.optimizer_type == "rmsprop":
             optimizer_cls = torch.optim.RMSprop
         else:
-            optimizer_cls = None
+            optimizer_cls = torch.optim.AdamW
 
         # Only alignment handler parameters
         align_lr = getattr(self.config, "alignment_lr", self.config.lr_G)
@@ -124,12 +120,9 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
             **self.config.opt_kwargs,
         )
 
-        self.D_params = list(filter(lambda p: p.requires_grad, self.D.parameters()))
-        self.D_opt = optimizer_cls(
-            self.D_params,
-            lr=self.config.lr_D,
-            **self.config.opt_kwargs,
-        )
+        # No D optimizer
+        self.D_params = []
+        self.D_opt = None
 
     def attach_accelerator_hooks(self):
         """Save only alignment handler weights."""
@@ -150,7 +143,10 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
 
         def load_model_hook(models, input_dir):
             model = models.pop()
-            state_dict = torch.load(os.path.join(input_dir, "state_dict.pth"))
+            state_dict = torch.load(
+                os.path.join(input_dir, "state_dict.pth"),
+                map_location="cpu", weights_only=False,
+            )
             m, u = model.load_state_dict(state_dict, strict=False)
             logger.info(f"Stage 1: Loading alignment params, missing: {len(m)}, unexpected: {len(u)}")
 
@@ -158,23 +154,17 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
     def log_grads(self):
-        """Override: only log alignment handler gradients (no LoRA)."""
-        self.unwrap_model(self.D).eval().requires_grad_(False)
-        x = self.forward_generator()
-        loss_l2 = F.mse_loss(x, self.batch_inputs.gt, reduction="mean") * self.config.lambda_l2
-        loss_lpips = self.net_lpips(x, self.batch_inputs.gt).mean() * self.config.lambda_lpips
-        loss_disc = self.D(x, for_G=True).mean() * self.config.lambda_gan
-        losses = [("l2", loss_l2), ("lpips", loss_lpips), ("disc", loss_disc)]
+        """Override: only log alignment handler gradients."""
+        noise_pred = self.forward_generator()
+        loss = F.l1_loss(noise_pred.float(), self.batch_inputs.noise.float(), reduction="mean")
+
         grad_dict = {}
         self.G_opt.zero_grad()
-        for idx, (name, loss) in enumerate(losses):
-            retain_graph = idx != len(losses) - 1
-            loss.backward(retain_graph=retain_graph)
+        loss.backward()
 
-            # Only alignment handler gradients
-            for pname, param in self.G.alignment_handler.named_parameters():
-                if param.grad is not None:
-                    grad_dict[f"align_grad/{pname}_{name}"] = param.grad.norm().item()
+        for pname, param in self.G.alignment_handler.named_parameters():
+            if param.grad is not None:
+                grad_dict[f"align_grad/{pname}"] = param.grad.norm().item()
 
-            self.G_opt.zero_grad()
+        self.G_opt.zero_grad()
         self.accelerator.log(grad_dict, step=self.global_step)

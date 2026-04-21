@@ -1,19 +1,18 @@
 """
-SD2 Trainer with alignment module for RM+HYPIR pipeline.
+SD2 Alignment Trainer — FaithDiff-style noise prediction training.
 
-Extends BaseTrainer to:
-1. Initialize UNet with alignment module
-2. Optionally load frozen RM model for x_en generation
-3. Encode LQ through VAE to get z_lq, and x_en via RM→VAE encode
-4. Pass x_en through alignment module to align with x_hq
-5. Fuse alignment features into UNet forward pass
+Training flow (follows FaithDiff, fixed t=200 for single-step inference):
+  1. GT → VAE encode → z_hq → add_noise(t=200) → noisy_hq (UNet input)
+  2. LQ → RM → VAE encode → x_en → AlignmentHandler → features
+  3. UNet(noisy_hq, t=200, text, features) → noise_pred
+  4. Loss = L1(noise_pred, noise)
 
-Alignment input: x_en = VAE.encode(RM(LQ)) — latent-space representation.
+No discriminator needed. Pure diffusion noise prediction.
+Fixed timestep ensures training/inference consistency for single-step mode.
 """
 
 import os
 import csv
-import json
 import logging
 from typing import List, Dict
 from pathlib import Path
@@ -30,6 +29,7 @@ from HYPIR.trainer.base import BaseTrainer, BatchInput
 from HYPIR.alignment.alignment_handler import AlignmentHandler
 from HYPIR.model.unet_alignment import UNetAlignment
 from HYPIR.rm.restoration_module import RestorationModule
+from HYPIR.utils.common import print_vram_state
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -37,7 +37,7 @@ logger = get_logger(__name__, log_level="INFO")
 class SD2AlignmentTrainer(BaseTrainer):
 
     def init_scheduler(self):
-        self.scheduler = DDPMScheduler.from_pretrained(
+        self.noise_scheduler = DDPMScheduler.from_pretrained(
             self.config.base_model_path, subfolder="scheduler"
         )
 
@@ -68,7 +68,7 @@ class SD2AlignmentTrainer(BaseTrainer):
         self.init_vae()
         self.init_rm()
         self.init_generator()
-        self.init_discriminator()
+        # Skip discriminator — not needed for noise prediction
         self.init_lpips()
 
     def init_rm(self):
@@ -119,10 +119,15 @@ class SD2AlignmentTrainer(BaseTrainer):
         hypir_pretrained = getattr(self.config, "hypir_pretrained_path", None)
         if hypir_pretrained is not None and os.path.exists(hypir_pretrained):
             logger.info(f"Loading HYPIR pretrained LoRA from {hypir_pretrained}")
-            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu")
-            m, u = unet.load_state_dict(pretrained_sd, strict=False)
-            logger.info(f"Loaded HYPIR LoRA: {len(pretrained_sd)} params, "
-                        f"missing: {len(m)}, unexpected: {len(u)}")
+            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu", weights_only=False)
+            # Handle double-dot keys
+            cleaned_sd = {}
+            for k, v in pretrained_sd.items():
+                cleaned_sd[k] = v
+            m, u = unet.load_state_dict(cleaned_sd, strict=False)
+            loaded_lora = sum(1 for k in unet.state_dict() if "lora" in k)
+            logger.info(f"Loaded HYPIR LoRA: {len(cleaned_sd)} keys, "
+                        f"LoRA keys in model: {loaded_lora}")
         else:
             logger.warning("No HYPIR pretrained LoRA found, using random LoRA init")
 
@@ -153,21 +158,18 @@ class SD2AlignmentTrainer(BaseTrainer):
         alignment_pretrained = getattr(self.config, "alignment_pretrained_path", None)
         if alignment_pretrained is not None:
             logger.info(f"Loading Stage 1 alignment weights from {alignment_pretrained}")
-            pretrained_sd = torch.load(alignment_pretrained, map_location="cpu")
-            # Filter to alignment_handler keys only
+            pretrained_sd = torch.load(alignment_pretrained, map_location="cpu", weights_only=False)
             align_sd = {}
             for k, v in pretrained_sd.items():
                 if k.startswith("alignment_handler."):
+                    key = k[len("alignment_handler."):].lstrip(".")
+                    align_sd[key] = v
+                else:
                     align_sd[k] = v
             if align_sd:
-                m, u = self.G.load_state_dict(align_sd, strict=False)
-                logger.info(f"Loaded {len(align_sd)} alignment pretrained params, "
-                           f"missing: {len(m)}, unexpected: {len(u)}")
-            else:
-                logger.warning(f"No alignment_handler keys found in {alignment_pretrained}, "
-                              f"loading all keys with strict=False")
-                m, u = self.G.load_state_dict(pretrained_sd, strict=False)
-                logger.info(f"Loaded pretrained, missing: {len(m)}, unexpected: {len(u)}")
+                m, u = self.G.alignment_handler.load_state_dict(align_sd, strict=False)
+                logger.info(f"Loaded alignment pretrained params, "
+                            f"missing: {len(m)}, unexpected: {len(u)}")
 
         # Move LoRA params to float32 for stable training
         lora_params = [p for p in unet.parameters() if p.requires_grad]
@@ -183,25 +185,30 @@ class SD2AlignmentTrainer(BaseTrainer):
                      f"{sum(p.numel() for p in handler.parameters())/1e6:.2f}M")
 
     def init_discriminator(self):
-        super().init_discriminator()
+        """Skip discriminator — not needed for noise prediction training."""
+        self.D = None
+        logger.info("Skipping discriminator (noise prediction training)")
+
+    def init_lpips(self):
+        """Skip LPIPS — not needed for noise prediction training."""
+        self.net_lpips = None
 
     def init_optimizers(self):
-        """Override to include alignment handler params in G optimizer."""
-        logger.info(f"Creating {self.config.optimizer_type} optimizers")
+        """Override: only G optimizer with LoRA + alignment params."""
+        logger.info(f"Creating {self.config.optimizer_type} optimizer (LoRA + alignment)")
         if self.config.optimizer_type == "adam":
             optimizer_cls = torch.optim.AdamW
         elif self.config.optimizer_type == "rmsprop":
             optimizer_cls = torch.optim.RMSprop
         else:
-            optimizer_cls = None
+            optimizer_cls = torch.optim.AdamW
 
         # Collect LoRA params from UNet + alignment handler params
         self.G_params = list(filter(lambda p: p.requires_grad, self.G.parameters()))
         align_params = list(self.G.alignment_handler.parameters())
         existing_ids = {id(p) for p in self.G_params}
         self.G_params.extend([p for p in align_params if id(p) not in existing_ids])
-        logger.info(f"G params: LoRA={sum(1 for p in self.G.unet.parameters() if p.requires_grad)} tensors, "
-                     f"Alignment={len(align_params)} tensors")
+        logger.info(f"G params: {len(self.G_params)} tensors")
 
         self.G_opt = optimizer_cls(
             self.G_params,
@@ -209,12 +216,20 @@ class SD2AlignmentTrainer(BaseTrainer):
             **self.config.opt_kwargs,
         )
 
-        self.D_params = list(filter(lambda p: p.requires_grad, self.D.parameters()))
-        self.D_opt = optimizer_cls(
-            self.D_params,
-            lr=self.config.lr_D,
-            **self.config.opt_kwargs,
+        # No D optimizer
+        self.D_params = []
+        self.D_opt = None
+
+    def prepare_all(self):
+        """Override: only prepare G, G_opt, dataloader (no D)."""
+        logger.info("Wrapping models, optimizers and dataloaders")
+        attrs = ["G", "G_opt", "dataloader"]
+        prepared_objs = self.accelerator.prepare(
+            self.G, self.G_opt, self.dataloader
         )
+        for attr, obj in zip(attrs, prepared_objs):
+            setattr(self, attr, obj)
+        print_vram_state("After accelerator.prepare", logger=logger)
 
     def attach_accelerator_hooks(self):
         def save_model_hook(models, weights, output_dir):
@@ -239,7 +254,10 @@ class SD2AlignmentTrainer(BaseTrainer):
 
         def load_model_hook(models, input_dir):
             model = models.pop()
-            state_dict = torch.load(os.path.join(input_dir, "state_dict.pth"))
+            state_dict = torch.load(
+                os.path.join(input_dir, "state_dict.pth"),
+                map_location="cpu", weights_only=False,
+            )
             m, u = model.load_state_dict(state_dict, strict=False)
             logger.info(f"Loading lora+alignment params, missing: {len(m)}, unexpected: {len(u)}")
 
@@ -247,6 +265,7 @@ class SD2AlignmentTrainer(BaseTrainer):
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
     def prepare_batch_inputs(self, batch):
+        """FaithDiff-style: encode GT + add noise, encode RM(LQ) for alignment."""
         batch = self.batch_transform(batch)
         gt = (batch["GT"] * 2 - 1).float()
         lq = (batch["LQ"] * 2 - 1).float()
@@ -255,86 +274,82 @@ class SD2AlignmentTrainer(BaseTrainer):
 
         c_txt = self.encode_prompt(prompt)
 
-        # Encode LQ through VAE → z_lq (used as UNet input)
-        z_lq = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample()
+        # 1. GT → VAE encode → z_hq → add noise
+        with torch.no_grad():
+            z_hq = self.vae.encode(gt.to(self.weight_dtype)).latent_dist.sample()
+            z_hq = z_hq * self.vae.config.scaling_factor
 
-        # x_en = VAE.encode(RM(LQ)): VAE-encoded RM output (latent space)
+        noise = torch.randn_like(z_hq)
+        noise_offset = getattr(self.config, "noise_offset", None)
+        if noise_offset:
+            noise += noise_offset * torch.randn(
+                (z_hq.shape[0], z_hq.shape[1], 1, 1),
+                device=z_hq.device, dtype=z_hq.dtype,
+            )
+
+        # Fixed timestep t=200 for single-step inference compatibility
+        model_t = getattr(self.config, "model_t", 200)
+        timesteps = torch.full((bs,), model_t, device=z_hq.device, dtype=torch.long)
+        noisy_hq = self.noise_scheduler.add_noise(z_hq, noise, timesteps)
+
+        # 2. RM(LQ) → VAE encode → x_en
         if self.rm is not None:
             with torch.no_grad():
                 lq_01 = (lq + 1) / 2  # [-1,1] → [0,1] for RM
-                x_rm = self.rm.inference(lq_01.to(self.device))  # [0,1] range
+                x_rm = self.rm.inference(lq_01.to(self.device))
                 x_rm_normalized = (x_rm * 2 - 1).to(dtype=self.weight_dtype)
                 x_en = self.vae.encode(x_rm_normalized).latent_dist.sample()
         else:
-            x_en = z_lq  # Fallback when RM is disabled
-
-        timesteps = torch.full(
-            (bs,), self.config.model_t, dtype=torch.long, device=self.device
-        )
+            with torch.no_grad():
+                x_en = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample()
 
         self.batch_inputs = BatchInput(
             gt=gt, lq=lq,
-            z_lq=z_lq,
-            c_txt=c_txt, timesteps=timesteps,
-            prompt=prompt,
+            z_hq=z_hq, noise=noise,
+            noisy_hq=noisy_hq,
+            timesteps=timesteps,
+            c_txt=c_txt, prompt=prompt,
         )
         self.batch_inputs.update(x_en=x_en)
 
     def forward_generator(self) -> torch.Tensor:
-        z_in = self.batch_inputs.z_lq * self.vae.config.scaling_factor
+        """Predict noise from noisy_hq using UNet + alignment features."""
         x_en = self.batch_inputs.x_en
-
-        eps = self.G(
-            z_in,
+        noise_pred = self.G(
+            self.batch_inputs.noisy_hq,
             self.batch_inputs.timesteps,
             encoder_hidden_states=self.batch_inputs.c_txt["text_embed"],
             x_en=x_en,
         ).sample
+        return noise_pred
 
-        z = self.scheduler.step(eps, self.config.coeff_t, z_in).pred_original_sample
-        x = self.vae.decode(
-            z.to(self.weight_dtype) / self.vae.config.scaling_factor
-        ).sample.float()
-        return x
+    def optimize_generator(self):
+        """Single optimization step: L1 noise prediction loss."""
+        with self.accelerator.accumulate(self.G):
+            noise_pred = self.forward_generator()
+            noise = self.batch_inputs.noise
 
-    # ------------------------------------------------------------------
-    # Phase 6: Training loss persistence, visualization, logging
-    # ------------------------------------------------------------------
+            loss = F.l1_loss(noise_pred.float(), noise.float(), reduction="mean")
 
-    def on_training_start(self):
-        """Initialize EMA (from base) and loss CSV logger."""
-        super().on_training_start()
-        self.loss_csv_path = os.path.join(self.config.output_dir, "loss_log.csv")
-        if self.accelerator.is_main_process:
-            with open(self.loss_csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["step", "G_total", "G_mse", "G_lpips", "G_disc", "D", "D_logits_real", "D_logits_fake"])
+            self.accelerator.backward(loss)
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.G_params, self.config.max_grad_norm)
+            self.G_opt.step()
+            self.G_opt.zero_grad()
 
-    def log_loss_to_csv(self, step: int, train_loss: dict):
-        """Append loss values to CSV file."""
-        if not self.accelerator.is_main_process:
-            return
-        row = [
-            step,
-            train_loss.get("G_total", ""),
-            train_loss.get("G_mse", ""),
-            train_loss.get("G_lpips", ""),
-            train_loss.get("G_disc", ""),
-            train_loss.get("D", ""),
-            train_loss.get("D_logits_real", ""),
-            train_loss.get("D_logits_fake", ""),
-        ]
-        with open(self.loss_csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+        loss_dict = dict(noise_loss=loss)
+        return loss_dict
+
+    def optimize_discriminator(self):
+        """No-op: discriminator not used in noise prediction training."""
+        return {}
 
     def log_images(self):
-        """Override to add RM output and alignment feature heatmaps."""
+        """Log LQ, GT, and noise prediction quality."""
         N = 4
         image_logs = dict(
             lq=(self.batch_inputs.lq[:N] + 1) / 2,
             gt=(self.batch_inputs.gt[:N] + 1) / 2,
-            G=(self.G_pred[:N] + 1) / 2,
             prompt=(self._log_txt_as_img(self.batch_inputs.prompt[:N]) + 1) / 2,
         )
 
@@ -345,37 +360,27 @@ class SD2AlignmentTrainer(BaseTrainer):
                 x_rm = self.rm.inference(lq_01.to(self.device))
                 image_logs["x_rm"] = x_rm[:N].clamp(0, 1)
 
-        # EMA output
-        if self.config.use_ema:
-            self.ema_handler.activate_ema_weights()
-            with torch.no_grad():
-                ema_x = self.forward_generator()
-                image_logs["G_ema"] = (ema_x[:N] + 1) / 2
-            self.ema_handler.deactivate_ema_weights()
-
         # Alignment feature heatmaps
         with torch.no_grad():
             handler = self.G.alignment_handler
             x_en = self.batch_inputs.x_en[:N]
             handler_dtype = next(handler.parameters()).dtype
-            enc_feat = handler.alignment_encoder(x_en.to(dtype=handler_dtype))  # [B, 512, H/8, W/8]
-            emb_feat = handler.condition_embedding(enc_feat)  # [B, 320, H/8, W/8]
+            enc_feat = handler.alignment_encoder(x_en.to(dtype=handler_dtype))
+            emb_feat = handler.condition_embedding(enc_feat)
             unet_sample = self.G.unet.conv_in(
-                self.batch_inputs.z_lq[:N] * self.vae.config.scaling_factor
+                self.batch_inputs.noisy_hq[:N]
             )
             fused = handler.fuse_with_unet_features(unet_sample, emb_feat)
 
-            # Take first channel and normalize to [0,1] for visualization
             for tag, feat in [("align_encoder", enc_feat), ("align_embedding", emb_feat), ("align_fused", fused)]:
-                heatmap = feat[:, 0:1]  # [B, 1, H, W]
+                heatmap = feat[:, 0:1]
                 heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
                 heatmap = F.interpolate(heatmap, size=(512, 512), mode="bilinear", align_corners=False)
-                image_logs[tag] = heatmap.expand(-1, 3, -1, -1)  # grayscale → 3ch
+                image_logs[tag] = heatmap.expand(-1, 3, -1, -1)
 
         if not self.accelerator.is_main_process:
             return
 
-        # Tensorboard
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
                 for tag, images in image_logs.items():
@@ -399,12 +404,46 @@ class SD2AlignmentTrainer(BaseTrainer):
 
     @staticmethod
     def _log_txt_as_img(texts):
-        """Import helper for log_txt_as_img."""
         from HYPIR.utils.common import log_txt_as_img
         return log_txt_as_img((256, 256), texts)
 
+    def log_grads(self):
+        """Log alignment handler and LoRA gradient norms."""
+        self.unwrap_model(self.G)
+        noise_pred = self.forward_generator()
+        loss = F.l1_loss(noise_pred.float(), self.batch_inputs.noise.float(), reduction="mean")
+
+        grad_dict = {}
+        self.G_opt.zero_grad()
+        loss.backward()
+
+        # Alignment handler gradients
+        for pname, param in self.G.alignment_handler.named_parameters():
+            if param.grad is not None:
+                grad_dict[f"align_grad/{pname}"] = param.grad.norm().item()
+
+        self.G_opt.zero_grad()
+        self.accelerator.log(grad_dict, step=self.global_step)
+
+    def on_training_start(self):
+        """Initialize EMA and CSV logger."""
+        super().on_training_start()
+        self.loss_csv_path = os.path.join(self.config.output_dir, "loss_log.csv")
+        if self.accelerator.is_main_process:
+            with open(self.loss_csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["step", "noise_loss"])
+
+    def log_loss_to_csv(self, step: int, train_loss: dict):
+        if not self.accelerator.is_main_process:
+            return
+        row = [step, train_loss.get("noise_loss", "")]
+        with open(self.loss_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
     def run(self):
-        """Override to add loss CSV logging during training."""
+        """Simplified training loop: no G/D alternation, just noise prediction."""
         self.attach_accelerator_hooks()
         self.on_training_start()
         self.batch_count = 0
@@ -412,38 +451,33 @@ class SD2AlignmentTrainer(BaseTrainer):
             train_loss = {}
             for batch in self.dataloader:
                 self.prepare_batch_inputs(batch)
-                bs = len(self.batch_inputs.lq)
-                generator_step = ((self.batch_count // self.config.gradient_accumulation_steps) % 2) == 0
-                if generator_step:
-                    loss_dict = self.optimize_generator()
-                else:
-                    loss_dict = self.optimize_discriminator()
 
+                # Single optimization step (no G/D alternation)
+                loss_dict = self.optimize_generator()
+
+                bs = len(self.batch_inputs.lq)
                 for k, v in loss_dict.items():
                     avg_loss = self.accelerator.gather(v.repeat(bs)).mean()
                     if k not in train_loss:
                         train_loss[k] = 0
-                    train_loss[k] += avg_loss.item() / self.config.gradient_accumulation_steps
+                    train_loss[k] += avg_loss.item()
 
                 self.batch_count += 1
                 if self.accelerator.sync_gradients:
-                    if generator_step:
-                        self.ema_handler.update()
-                    from HYPIR.utils.common import print_vram_state
-                    state = "Generator     Step" if not generator_step else "Discriminator Step"
+                    self.ema_handler.update()
                     _, _, peak = print_vram_state(None)
-                    self.pbar.set_description(f"{state}, VRAM peak: {peak:.2f} GB")
+                    self.pbar.set_description(f"Step, VRAM peak: {peak:.2f} GB")
 
-                if self.accelerator.sync_gradients and not generator_step:
                     self.global_step += 1
                     self.pbar.update(1)
-                    # Log to CSV before clearing
                     self.log_loss_to_csv(self.global_step, train_loss)
+
                     log_dict = {}
                     for k in train_loss.keys():
                         log_dict[f"loss/{k}"] = train_loss[k]
                     train_loss = {}
                     self.accelerator.log(log_dict, step=self.global_step)
+
                     if self.global_step % self.config.log_image_steps == 0 or self.global_step == 1:
                         self.log_images()
                     if self.global_step % self.config.log_grad_steps == 0 or self.global_step == 1:
@@ -454,37 +488,3 @@ class SD2AlignmentTrainer(BaseTrainer):
                 if self.global_step >= self.config.max_train_steps:
                     break
         self.accelerator.end_training()
-
-    def log_grads(self):
-        """Override to also log alignment handler gradients."""
-        self.unwrap_model(self.D).eval().requires_grad_(False)
-        x = self.forward_generator()
-        loss_l2 = F.mse_loss(x, self.batch_inputs.gt, reduction="mean") * self.config.lambda_l2
-        loss_lpips = self.net_lpips(x, self.batch_inputs.gt).mean() * self.config.lambda_lpips
-        loss_disc = self.D(x, for_G=True).mean() * self.config.lambda_gan
-        losses = [("l2", loss_l2), ("lpips", loss_lpips), ("disc", loss_disc)]
-        grad_dict = {}
-        self.G_opt.zero_grad()
-        for idx, (name, loss) in enumerate(losses):
-            retain_graph = idx != len(losses) - 1
-            loss.backward(retain_graph=retain_graph)
-            # LoRA module gradients
-            lora_module_grads = {}
-            for module_name, module in self.unwrap_model(self.G).named_modules():
-                for suffix in self.config.log_grad_modules:
-                    if module_name.endswith(suffix):
-                        flat_grad = torch.cat([
-                            p.grad.flatten() for p in module.parameters() if p.requires_grad
-                        ])
-                        lora_module_grads.setdefault(suffix, []).append(flat_grad)
-                        break
-            for k, v in lora_module_grads.items():
-                grad_dict[f"grad_norm/{k}_{name}"] = torch.norm(torch.cat(v)).item()
-
-            # Alignment handler gradients
-            for pname, param in self.G.alignment_handler.named_parameters():
-                if param.grad is not None:
-                    grad_dict[f"align_grad/{pname}_{name}"] = param.grad.norm().item()
-
-            self.G_opt.zero_grad()
-        self.accelerator.log(grad_dict, step=self.global_step)

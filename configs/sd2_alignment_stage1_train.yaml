@@ -1,5 +1,5 @@
 # Stage 1: Alignment pretraining — freeze HYPIR pretrained LoRA, only train alignment handler
-# After this stage, alignment weights are loaded into Stage 2 for joint training
+# FaithDiff-style noise prediction training
 
 output_dir: output_alignment_stage1
 
@@ -71,8 +71,6 @@ data_config:
 
 base_model_type: sd2_alignment_stage1
 base_model_path: checkpoints/sd2
-model_t: 200
-coeff_t: 200
 
 # HYPIR pretrained LoRA — loaded then frozen during Stage 1
 hypir_pretrained_path: checkpoints/HYPIR/HYPIR_sd2.pth
@@ -98,20 +96,20 @@ rm:
   frozen: true
 
 # Stage 1 specific settings
+model_t: 200  # Fixed timestep for single-step inference
 alignment_lr: 1e-4    # Alignment handler learning rate
 
-lambda_gan: 0.5
-lambda_lpips: 5
-lambda_l2: 1
-lr_G: 1e-4            # Not used directly (alignment_lr takes precedence)
-lr_D: 1e-5
+# Noise prediction training — no GAN/LPIPS needed
+lr_G: 1e-4
 optimizer_type: adam
 opt_kwargs:
   betas: [0.9, 0.999]
 
+noise_offset: ~  # optional noise offset for training
+
 mixed_precision: bf16
 seed: 231
-max_train_steps: 3000
+max_train_steps: 6000
 gradient_accumulation_steps: 1
 gradient_checkpointing: true
 max_grad_norm: 1.0
@@ -120,9 +118,8 @@ report_to: tensorboard
 checkpointing_steps: 500
 checkpoints_total_limit: 2
 resume_from_checkpoint: ~
-log_image_steps: 100
-log_grad_steps: 100
-log_grad_modules: [conv_out]
+log_image_steps: 500
+log_grad_steps: 500
 
 use_ema: true
 ema_decay: 0.999

@@ -117,11 +117,9 @@ class RMHYPIRPipeline:
                              base_model_path: str,
                              weight_path: str,
                              lora_modules: str = "to_k,to_q,to_v,to_out.0,conv,conv1,conv2,conv_shortcut,conv_out,proj_in,proj_out,ff.net.2,ff.net.0.proj",
-                             lora_rank: int = 256,
-                             model_t: int = 200,
-                             coeff_t: int = 200) -> None:
+                             lora_rank: int = 256) -> None:
         """
-        Load HYPIR model with alignment module.
+        Load HYPIR model with alignment module (FaithDiff-style multi-step denoising).
 
         Supports loading both HYPIR original LoRA weights and Stage 2
         trained weights (LoRA + alignment_handler).
@@ -131,8 +129,6 @@ class RMHYPIRPipeline:
             weight_path: Path to weight file (LoRA-only or LoRA+alignment)
             lora_modules: Comma-separated LoRA module names
             lora_rank: LoRA rank
-            model_t: Model timestep
-            coeff_t: Coefficient timestep
         """
         if not ALIGNMENT_AVAILABLE:
             raise ImportError("Alignment enhancer not available. Check installation.")
@@ -142,8 +138,6 @@ class RMHYPIRPipeline:
             weight_path=weight_path,
             lora_modules=lora_modules.split(","),
             lora_rank=lora_rank,
-            model_t=model_t,
-            coeff_t=coeff_t,
             device=self.device,
         )
 
@@ -245,7 +239,8 @@ class RMHYPIRPipeline:
                         captioner: str = "empty",
                         fixed_caption: Optional[str] = None,
                         scale_by: str = "factor",
-                        target_longest_side: Optional[int] = None) -> torch.Tensor:
+                        target_longest_side: Optional[int] = None,
+                        model_t: int = 200) -> torch.Tensor:
         """
         Run HYPIR stage only.
 
@@ -259,6 +254,7 @@ class RMHYPIRPipeline:
             stride: HYPIR stride
             captioner: Captioner type ('empty' or 'fixed')
             fixed_caption: Fixed caption if captioner='fixed'
+            model_t: Timestep for single-step inference (default: 200)
 
         Returns:
             HYPIR output tensor
@@ -287,7 +283,8 @@ class RMHYPIRPipeline:
                 upscale=upscale,
                 target_longest_side=target_longest_side,
                 patch_size=patch_size,
-                stride=stride
+                stride=stride,
+                model_t=model_t
             )
 
         print(f"HYPIR output shape: {hypir_output.shape}")
@@ -308,7 +305,8 @@ class RMHYPIRPipeline:
             fixed_caption: Optional[str] = None,
             scale_by: str = "factor",
             target_longest_side: Optional[int] = None,
-            ensure_min_size: bool = False) -> torch.Tensor:
+            ensure_min_size: bool = False,
+            model_t: int = 200) -> torch.Tensor:
         """
         Run full two-stage pipeline.
 
@@ -327,6 +325,7 @@ class RMHYPIRPipeline:
             scale_by: Scaling method for HYPIR
             target_longest_side: Target longest side when scale_by='longest_side'
             ensure_min_size: Whether to resize RM output to meet minimum size (default: False)
+            model_t: Timestep for single-step inference (default: 200)
 
         Returns:
             Final enhanced tensor
@@ -357,7 +356,8 @@ class RMHYPIRPipeline:
             captioner=captioner,
             fixed_caption=fixed_caption,
             scale_by=scale_by,
-            target_longest_side=target_longest_side
+            target_longest_side=target_longest_side,
+            model_t=model_t
         )
 
         print("=" * 50)
