@@ -194,9 +194,14 @@ class UNetAlignment(nn.Module):
         alignment_sd = {}
         for k, v in state_dict.items():
             if k.startswith("unet."):
-                unet_sd[k[5:]] = v
+                # Handle double-dot keys from training: "unet..X" -> "X"
+                key = k[len("unet."):]
+                key = key.lstrip(".")
+                unet_sd[key] = v
             elif k.startswith("alignment_handler."):
-                alignment_sd[k[18:]] = v
+                key = k[len("alignment_handler."):]
+                key = key.lstrip(".")
+                alignment_sd[key] = v
             else:
                 unet_sd[k] = v
 

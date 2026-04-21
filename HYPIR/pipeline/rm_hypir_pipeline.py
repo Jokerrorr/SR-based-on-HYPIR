@@ -85,7 +85,7 @@ class RMHYPIRPipeline:
                    model_t: int = 1000,
                    coeff_t: int = 400) -> None:
         """
-        Load HYPIR model.
+        Load HYPIR model (standard, without alignment).
 
         Args:
             base_model_path: Path to base Stable Diffusion model
@@ -112,6 +112,44 @@ class RMHYPIRPipeline:
         print("Initializing HYPIR models...")
         self.hypir_model.init_models()
         print("HYPIR model loaded")
+
+    def load_hypir_alignment(self,
+                             base_model_path: str,
+                             weight_path: str,
+                             lora_modules: str = "to_k,to_q,to_v,to_out.0,conv,conv1,conv2,conv_shortcut,conv_out,proj_in,proj_out,ff.net.2,ff.net.0.proj",
+                             lora_rank: int = 256,
+                             model_t: int = 200,
+                             coeff_t: int = 200) -> None:
+        """
+        Load HYPIR model with alignment module.
+
+        Supports loading both HYPIR original LoRA weights and Stage 2
+        trained weights (LoRA + alignment_handler).
+
+        Args:
+            base_model_path: Path to base Stable Diffusion model
+            weight_path: Path to weight file (LoRA-only or LoRA+alignment)
+            lora_modules: Comma-separated LoRA module names
+            lora_rank: LoRA rank
+            model_t: Model timestep
+            coeff_t: Coefficient timestep
+        """
+        if not ALIGNMENT_AVAILABLE:
+            raise ImportError("Alignment enhancer not available. Check installation.")
+
+        self.hypir_model = SD2AlignmentEnhancer(
+            base_model_path=base_model_path,
+            weight_path=weight_path,
+            lora_modules=lora_modules.split(","),
+            lora_rank=lora_rank,
+            model_t=model_t,
+            coeff_t=coeff_t,
+            device=self.device,
+        )
+
+        print("Initializing HYPIR+Alignment models...")
+        self.hypir_model.init_models()
+        print("HYPIR+Alignment model loaded")
 
     def _ensure_initialized(self) -> None:
         """Check if both models are loaded."""
@@ -237,14 +275,10 @@ class RMHYPIRPipeline:
 
         # Run HYPIR enhancement
         with torch.no_grad():
-            # If using alignment enhancer, pass VAE-encoded RM output (x_en)
+            # If using alignment enhancer, pass RM pixel output —
+            # enhance() will VAE-encode it at the correct scale internally
             if ALIGNMENT_AVAILABLE and isinstance(self.hypir_model, SD2AlignmentEnhancer):
-                # Encode RM output through VAE to get x_en
-                rm_normalized = (rm_output * 2 - 1).to(
-                    dtype=self.hypir_model.weight_dtype, device=self.hypir_model.device
-                )
-                x_en = self.hypir_model.vae.encode(rm_normalized).latent_dist.sample()
-                self.hypir_model.set_alignment_input(x_en)
+                self.hypir_model.set_rm_output(rm_output)
 
             hypir_output = self.hypir_model.enhance(
                 lq=rm_output,
