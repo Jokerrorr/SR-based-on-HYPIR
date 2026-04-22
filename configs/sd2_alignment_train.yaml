@@ -1,3 +1,7 @@
+# Stage 2: Adversarial fine-tuning with dual-side alignment
+# HYPIR original loss (GAN + LPIPS + L2) + alignment noise prediction loss
+# G/D alternating training
+
 output_dir: output_alignment
 
 data_config:
@@ -68,30 +72,25 @@ data_config:
 
 base_model_type: sd2_alignment
 base_model_path: checkpoints/sd2
+
+# HYPIR pretrained LoRA — loaded as initialization for joint training
+hypir_pretrained_path: checkpoints/HYPIR/HYPIR_sd2.pth
+
+# Set alignment_pretrained_path to load Stage 1 alignment weights
+alignment_pretrained_path: ~  # e.g. output_alignment_stage1/checkpoint-6000/state_dict.pth
+
 model_t: 200
 coeff_t: 200
 lora_rank: 256
 lora_modules: [to_k, to_q, to_v, to_out.0, conv, conv1, conv2, conv_shortcut, conv_out, proj_in, proj_out, ff.net.2, ff.net.0.proj]
-use_ema: true
-ema_decay: 0.999
-resume_ema: true
 
-# Stage 2: Joint adversarial training (LoRA + Alignment)
-# HYPIR pretrained LoRA — loaded as initialization for joint training
-hypir_pretrained_path: checkpoints/HYPIR/HYPIR_sd2.pth
-# Set alignment_pretrained_path to load Stage 1 alignment weights
-alignment_pretrained_path: ~  # e.g. output_alignment_stage1/checkpoint-3000/state_dict.pth
-
-# Alignment module configuration
+# Alignment module configuration (v4: dual-side alignment)
 alignment:
   enabled: true
   latent_channels: 4
-  encoder_block_out_channels: [128, 256, 512, 512]
+  encoder_block_out_channels: [128, 256, 512]
   transformer_layers: 2
-  transformer_dim: 640
   transformer_heads: 8
-  use_condition_embedding: true
-  add_sample: true
 
 # RM model configuration
 rm:
@@ -100,14 +99,19 @@ rm:
   weight_path: checkpoints/DiffBIR/scunet_color_real_psnr.pth
   frozen: true
 
+# Loss weights — HYPIR adversarial + alignment
 lambda_gan: 0.5
 lambda_lpips: 5
 lambda_l2: 1
+lambda_align: 1.0
+
 lr_G: 1e-5
 lr_D: 1e-5
 optimizer_type: adam
 opt_kwargs:
   betas: [0.9, 0.999]
+
+noise_offset: ~
 
 mixed_precision: bf16
 seed: 231
@@ -123,3 +127,7 @@ resume_from_checkpoint: ~
 log_image_steps: 100
 log_grad_steps: 100
 log_grad_modules: [conv_out]
+
+use_ema: true
+ema_decay: 0.999
+resume_ema: true

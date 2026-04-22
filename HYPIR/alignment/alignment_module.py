@@ -1,13 +1,13 @@
 """
 Alignment module components adapted from FaithDiff for RM+HYPIR integration.
 
-This alignment module takes VAE-encoded features x_en (output of VAE Encoder on RM output)
-and aligns them with x_hq features before feeding into UNet.
+v4 Architecture:
+- AlignmentModule: Dual-side alignment (z_lq, x_hq_t) → aligned latent
+- Input: z_lq [B,4,H,W], x_hq_t [B,4,H,W] (both VAE latent space)
+- Output: aligned [B,4,H,W] (residual added to x_hq_t)
+- Structure: concat(8ch) → encoder(128→256→512) → transformer → proj_out(512→4, zero_init) → residual
 
-Pipeline: LQ → RM → VAE Encoder → x_en → Alignment → UNet → VAE Decoder → HQ
-
-Key difference from FaithDiff: operates in latent space (4ch, H/8 × W/8),
-not pixel space. No spatial downsampling needed.
+Injection point: BEFORE conv_in (aligned latent goes directly into UNet as sample).
 """
 
 import torch
@@ -39,64 +39,57 @@ class LayerNorm(nn.LayerNorm):
         return ret.type(orig_type)
 
 
-class ControlNetConditioningEmbedding(nn.Module):
+class ResidualSwinBlock(nn.Module):
     """
-    Preprocess alignment conditioning inputs.
+    ResNet-style block for the alignment encoder.
 
-    Takes alignment encoder output and projects to UNet conv_in channel dim.
-    Architecture: GroupNorm → Conv → SiLU → zero_module(Conv)
-
-    Args:
-        conditioning_embedding_channels: Output channels (320, matching UNet conv_in).
-        conditioning_channels: Input channels (alignment encoder output channels).
+    Structure: GroupNorm → SiLU → Conv3x3 → GroupNorm → SiLU → Conv3x3 + residual
     """
 
     def __init__(
         self,
-        conditioning_embedding_channels: int = 320,
-        conditioning_channels: int = 4,
+        in_channels: int,
+        out_channels: int,
+        temb_channels: int = None,
+        eps: float = 1e-6,
     ):
         super().__init__()
-        self.conv_in = nn.Conv2d(
-            conditioning_channels, conditioning_channels, kernel_size=3, padding=1
-        )
-        self.norm_in = nn.GroupNorm(
-            num_channels=conditioning_channels,
-            num_groups=min(32, conditioning_channels),
-            eps=1e-6,
-        )
-        self.conv_out = zero_module(
-            nn.Conv2d(
-                conditioning_channels,
-                conditioning_embedding_channels,
-                kernel_size=3,
-                padding=1,
-            )
-        )
+        self.norm1 = nn.GroupNorm(num_groups=min(32, in_channels), num_channels=in_channels, eps=eps)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=min(32, out_channels), num_channels=out_channels, eps=eps)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
-    def forward(self, conditioning: torch.Tensor) -> torch.Tensor:
-        conditioning = self.norm_in(conditioning)
-        embedding = self.conv_in(conditioning)
-        embedding = F.silu(embedding)
-        embedding = self.conv_out(embedding)
-        return embedding
+        # Skip connection
+        if in_channels != out_channels:
+            self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        h = F.silu(h)
+        h = self.conv1(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+        h = self.conv2(h)
+        return h + self.skip(x)
 
 
 class ResidualAttentionBlock(nn.Module):
     """
     Transformer-style block with self-attention and MLP.
 
-    Used in the information transformer layers that fuse UNet conv_in output
-    with alignment features.
+    Used in the information transformer layers that fuse the concatenated
+    z_lq and x_hq_t features.
 
     Args:
-        d_model: Model dimension (typically 640 = 320 * 2 for concatenated features).
+        d_model: Model dimension (typically 512 for encoder output).
         n_head: Number of attention heads.
         attn_mask: Optional attention mask.
     """
 
     def __init__(
-        self, d_model: int = 640, n_head: int = 8, attn_mask: torch.Tensor = None
+        self, d_model: int = 512, n_head: int = 8, attn_mask: torch.Tensor = None
     ):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, n_head)
@@ -104,9 +97,9 @@ class ResidualAttentionBlock(nn.Module):
         self.mlp = nn.Sequential(
             OrderedDict(
                 [
-                    ("c_fc", nn.Linear(d_model, d_model * 2)),
+                    ("c_fc", nn.Linear(d_model, d_model * 4)),
                     ("gelu", QuickGELU()),
-                    ("c_proj", nn.Linear(d_model * 2, d_model)),
+                    ("c_proj", nn.Linear(d_model * 4, d_model)),
                 ]
             )
         )
@@ -125,3 +118,93 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+
+class AlignmentModule(nn.Module):
+    """
+    FaithDiff-style dual-side alignment module.
+
+    Input: z_lq [B, 4, H, W], x_hq_t [B, 4, H, W] (both VAE latent space)
+    Output: aligned [B, 4, H, W]
+
+    Structure:
+        concat(z_lq, x_hq_t) → [B, 8, H, W]
+        encoder: 8ch → 128 → 256 → 512 (ResNet blocks, no spatial downsample)
+        transformer: ResidualAttentionBlock layers (spatial flatten → attention → reshape)
+        proj_out: zero_init Conv2d(512, 4, 1)
+        output: x_hq_t + proj_out(transformer_output)
+
+    Args:
+        latent_channels: Input latent channels (4 for SD VAE).
+        hidden_channels: First encoder block channels.
+        encoder_channels: Progressive channel expansion (128, 256, 512).
+        num_layers: Number of transformer layers.
+        num_heads: Number of attention heads.
+    """
+
+    def __init__(
+        self,
+        latent_channels: int = 4,
+        hidden_channels: int = 128,
+        encoder_channels: tuple = (128, 256, 512),
+        num_layers: int = 2,
+        num_heads: int = 8,
+    ):
+        super().__init__()
+        self.latent_channels = latent_channels
+        self.encoder_channels = encoder_channels
+        self.hidden_dim = encoder_channels[-1]  # 512
+
+        # Input: concat(z_lq, x_hq_t) → 8 channels
+        in_ch = latent_channels * 2  # 8
+
+        # Encoder: progressive channel expansion
+        # 8 → 128 → 256 → 512
+        self.encoder = nn.ModuleList()
+
+        # First block: 8 → 128
+        self.encoder.append(ResidualSwinBlock(in_ch, encoder_channels[0]))
+
+        # Subsequent blocks: 128 → 256 → 512
+        for i in range(len(encoder_channels) - 1):
+            self.encoder.append(ResidualSwinBlock(encoder_channels[i], encoder_channels[i + 1]))
+
+        # Transformer: ResidualAttentionBlock layers
+        self.transformer = nn.Sequential(
+            *[ResidualAttentionBlock(self.hidden_dim, num_heads) for _ in range(num_layers)]
+        )
+
+        # Output projection: 512 → 4, zero-initialized for residual
+        self.proj_out = zero_module(nn.Conv2d(self.hidden_dim, latent_channels, kernel_size=1))
+
+    def forward(self, z_lq: torch.Tensor, x_hq_t: torch.Tensor) -> torch.Tensor:
+        """
+        Dual-side alignment forward pass.
+
+        Args:
+            z_lq: LQ latent [B, 4, H, W].
+            x_hq_t: HQ latent (current estimate) [B, 4, H, W].
+
+        Returns:
+            aligned: Aligned latent [B, 4, H, W].
+        """
+        # Concat along channel dimension
+        x = torch.cat([z_lq, x_hq_t], dim=1)  # [B, 8, H, W]
+
+        # Encoder: channel expansion, spatial preserved
+        for block in self.encoder:
+            x = block(x)  # [B, 512, H, W]
+
+        # Transformer: spatial attention
+        B, C, H, W = x.shape
+        # Flatten spatial dims → [H*W, B, C] for MultiheadAttention
+        x = x.view(B, C, H * W).permute(2, 0, 1)  # [H*W, B, C]
+        x = self.transformer(x)  # [H*W, B, C]
+        # Reshape back → [B, C, H, W]
+        x = x.permute(1, 2, 0).view(B, C, H, W)  # [B, 512, H, W]
+
+        # Output projection → [B, 4, H, W]
+        delta = self.proj_out(x)
+
+        # Residual: x_hq_t + delta
+        return x_hq_t + delta

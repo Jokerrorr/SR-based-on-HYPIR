@@ -1,16 +1,11 @@
 """
-SD2 Enhancer with alignment module for RM+HYPIR inference.
+SD2 Alignment Enhancer v4 — FaithDiff dual-side alignment inference.
 
-Extends SD2Enhancer to inject alignment features from x_en
-(VAE Encoder output on RM-restored image) into UNet forward pass.
+Training: AlignmentModule(z_lq, x_hq_t) → aligned → UNet → noise_pred
+Inference: AlignmentModule(z_lq, add_noise(z_lq)) → aligned → UNet(t=200) → z_pred → VAE.decode → HQ
 
-Alignment input: pixel-space RM output. x_en is computed inside enhance()
-at the same scale as z_lq so spatial dimensions always match.
-
-Pipeline flow:
-  LQ → VAE Enc → z_lq
-  RM(pixel) → scale/pad same as LQ → VAE Enc → x_en
-  z_lq, x_en → UNet(conv_in(z_lq) + alignment(x_en)) → z_out → VAE Dec
+v4: dual-side alignment (z_lq + x_hq_t) injected BEFORE conv_in.
+No GT at inference — use add_noise(VAE.encode(RM(LQ)), t=200) as x_hq_t approximation.
 """
 
 import numpy as np
@@ -60,37 +55,29 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         )
         unet.add_adapter(G_lora_cfg)
 
-        # Create alignment handler (latent-space input)
-        handler = AlignmentHandler(unet_conv_channels=320, latent_channels=4)
+        # Create alignment handler (v4: dual-side alignment)
+        handler = AlignmentHandler(latent_channels=4)
 
         # Wrap into UNetAlignment
         self.G = UNetAlignment(unet=unet, alignment_handler=handler)
 
-        # Load weights — supports both:
-        #   1. HYPIR original LoRA-only weights (514 keys, no alignment_handler prefix)
-        #   2. Stage 2 trained weights (LoRA + alignment_handler keys)
+        # Load weights
         print(f"Load model weights from {self.weight_path}")
         state_dict = torch.load(self.weight_path, map_location="cpu", weights_only=False)
 
         # UNetAlignment.load_state_dict auto-separates unet.* / alignment_handler.* keys
         missing, unexpected = self.G.load_state_dict(state_dict, strict=False)
 
-        # Report loading results
-        missing_unet_base = [k for k in missing if "lora" not in k and "alignment" not in k]
-        missing_lora = [k for k in missing if "lora" in k]
-        if missing_lora:
-            print(f"Warning: {len(missing_lora)} LoRA keys failed to load")
-        if unexpected:
-            print(f"Warning: {len(unexpected)} unexpected keys in weight file")
         lora_loaded = sum(1 for k in self.G.unet.state_dict() if "lora" in k)
         print(f"LoRA keys present in model: {lora_loaded}")
 
-        # Report alignment keys
-        align_keys = [k for k in state_dict if k.startswith("alignment_handler.")]
+        align_keys = [k for k in state_dict if k.startswith("alignment_handler")]
         if align_keys:
             print(f"Loaded {len(align_keys)} alignment_handler keys")
         else:
             print("No alignment_handler keys in weight file (using random init)")
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys")
 
         self.G.to(device=self.device, dtype=self.weight_dtype)
         self.G.eval().requires_grad_(False)
@@ -107,16 +94,10 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         text_embed = self.text_encoder(txt_ids.to(self.device))[0]
         c_txt = {"text_embed": text_embed}
         timesteps = torch.full((bs,), self.model_t, dtype=torch.long, device=self.device)
-        self.inputs = dict(
-            c_txt=c_txt,
-            timesteps=timesteps,
-        )
+        self.inputs = dict(c_txt=c_txt, timesteps=timesteps)
 
     def set_rm_output(self, rm_output: torch.Tensor):
-        """Store pixel-space RM output [B, 3, H, W] in [0, 1].
-
-        x_en will be computed inside enhance() at the same scale as z_lq.
-        """
+        """Store pixel-space RM output [B, 3, H, W] in [0, 1]."""
         self._rm_pixel = rm_output
 
     @torch.no_grad()
@@ -131,7 +112,7 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         stride: int = 256,
         return_type: Literal["pt", "np", "pil"] = "pt",
     ) -> torch.Tensor | np.ndarray | List[Image.Image]:
-        """Override enhance() to compute x_en at the same scale as z_lq."""
+        """v4 inference: dual-side alignment with RM output as z_lq."""
         if stride <= 0:
             raise ValueError("Stride must be greater than 0.")
         if patch_size <= 0:
@@ -141,7 +122,7 @@ class SD2AlignmentEnhancer(BaseEnhancer):
 
         bs = len(lq)
 
-        # --- Scale LQ (same as BaseEnhancer) ---
+        # --- Scale LQ ---
         if scale_by == "factor":
             lq = F.interpolate(lq, scale_factor=upscale, mode="bicubic")
         elif scale_by == "longest_side":
@@ -156,58 +137,55 @@ class SD2AlignmentEnhancer(BaseEnhancer):
 
         ref = lq
         h0, w0 = lq.shape[2:]
-        if min(h0, w0) <= patch_size:
-            lq = self.resize_at_least(lq, size=patch_size)
+
+        # Ensure minimum size
+        vae_scale_factor = 8
+        if min(h0, w0) < patch_size:
+            lq = F.interpolate(lq, size=(
+                max(h0, patch_size), max(w0, patch_size)
+            ), mode="bicubic")
+
+        h1, w1 = lq.shape[2:]
 
         # Pad to VAE multiple
-        vae_scale_factor = 8
+        ph = (vae_scale_factor - h1 % vae_scale_factor) % vae_scale_factor
+        pw = (vae_scale_factor - w1 % vae_scale_factor) % vae_scale_factor
         lq_norm = (lq * 2 - 1).to(dtype=self.weight_dtype, device=self.device)
-        h1, w1 = lq_norm.shape[2:]
-        ph = (h1 + vae_scale_factor - 1) // vae_scale_factor * vae_scale_factor - h1
-        pw = (w1 + vae_scale_factor - 1) // vae_scale_factor * vae_scale_factor - w1
         lq_norm = F.pad(lq_norm, (0, pw, 0, ph), mode="constant", value=0)
 
-        # --- Encode x_en from RM pixel output at the SAME size as padded LQ ---
+        # --- Encode RM output for z_lq (LQ side of alignment) ---
         rm_pixel = getattr(self, "_rm_pixel", None)
         if rm_pixel is not None:
-            rm_scaled = F.interpolate(rm_pixel.to(device=self.device), size=(h1, w1),
-                                       mode="bilinear", align_corners=False)
+            rm_scaled = F.interpolate(
+                rm_pixel.to(device=self.device), size=(h1, w1),
+                mode="bilinear", align_corners=False,
+            )
             rm_norm = (rm_scaled * 2 - 1).to(dtype=self.weight_dtype, device=self.device)
             rm_norm = F.pad(rm_norm, (0, pw, 0, ph), mode="constant", value=0)
-            x_en_full = self.vae.encode(rm_norm).latent_dist.sample()
-            self._x_en_precomputed = x_en_full
+            z_lq_full = self.vae.encode(rm_norm).latent_dist.sample()
         else:
-            self._x_en_precomputed = None
+            z_lq_full = self.vae.encode(lq_norm).latent_dist.sample()
 
-        # VAE encode LQ
-        z_lq = make_tiled_fn(
-            fn=lambda lq_tile: self.vae.encode(lq_tile).latent_dist.sample(),
-            size=patch_size,
-            stride=stride,
-            scale_type="down",
-            scale=vae_scale_factor,
-            progress=True,
-            channel=self.vae.config.latent_channels,
-            desc="VAE encoding",
-        )(lq_norm.to(self.weight_dtype))
+        self._z_lq_precomputed = z_lq_full
 
-        # Generator forward with x_en tile cropping
+        # --- Tiled generator forward ---
         self.prepare_inputs(batch_size=bs, prompt=prompt)
         latent_patch = patch_size // vae_scale_factor
         latent_stride = stride // vae_scale_factor
+
         z = make_tiled_fn(
             fn=self._tiled_generator_forward,
             size=latent_patch,
             stride=latent_stride,
             progress=True,
             desc="Generator Forward",
-        )(z_lq.to(self.weight_dtype), _align=True)
+        )(z_lq_full.to(self.weight_dtype))
 
         # Decode
         x = make_tiled_fn(
-            fn=lambda lq_tile: self.vae.decode(lq_tile).sample.float(),
-            size=patch_size // vae_scale_factor,
-            stride=stride // vae_scale_factor,
+            fn=lambda tile: self.vae.decode(tile).sample.float(),
+            size=latent_patch,
+            stride=latent_stride,
             scale_type="up",
             scale=vae_scale_factor,
             progress=True,
@@ -221,7 +199,7 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         x = wavelet_reconstruction(x, ref.to(device=self.device))
 
         # Cleanup
-        self._x_en_precomputed = None
+        self._z_lq_precomputed = None
 
         if return_type == "pt":
             return x.clamp(0, 1).cpu()
@@ -231,20 +209,21 @@ class SD2AlignmentEnhancer(BaseEnhancer):
             return [Image.fromarray(img) for img in self.tensor2image(x)]
 
     def _tiled_generator_forward(self, z_lq_tile, **kwargs):
-        """Forward generator for a single tile, cropping x_en to match."""
-        x_en = getattr(self, "_x_en_precomputed", None)
-        if x_en is not None and x_en.shape != z_lq_tile.shape:
-            tile_idx = kwargs.get("index")
-            if tile_idx is not None:
-                x_en = x_en[..., tile_idx.hi:tile_idx.hi_end, tile_idx.wi:tile_idx.wi_end]
-            else:
-                x_en = x_en[..., :z_lq_tile.shape[2], :z_lq_tile.shape[3]]
+        """v4 tiled forward: alignment(z_lq, add_noise(z_lq)) → UNet → scheduler.step."""
+        z_lq_tile = z_lq_tile * self.vae.config.scaling_factor
 
-        z_in = z_lq_tile * self.vae.config.scaling_factor
+        # Approximate x_hq_t: add noise to z_lq at t=model_t
+        noise = torch.randn_like(z_lq_tile)
+        x_hq_t = self.scheduler.add_noise(z_lq_tile, noise, self.inputs["timesteps"])
+
+        # Dual-side alignment
         eps = self.G(
-            z_in, self.inputs["timesteps"],
+            z_lq_tile,
+            self.inputs["timesteps"],
             encoder_hidden_states=self.inputs["c_txt"]["text_embed"],
-            x_en=x_en,
+            z_lq=z_lq_tile,
+            x_hq_t=x_hq_t,
         ).sample
-        z = self.scheduler.step(eps, self.coeff_t, z_in).pred_original_sample
+
+        z = self.scheduler.step(eps, self.model_t, z_lq_tile).pred_original_sample
         return z / self.vae.config.scaling_factor

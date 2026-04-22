@@ -1,8 +1,9 @@
 from .alignment_module import (
-    ControlNetConditioningEmbedding,
+    AlignmentModule,
     ResidualAttentionBlock,
+    ResidualSwinBlock,
     QuickGELU,
     LayerNorm,
+    zero_module,
 )
-from .alignment_encoder import LatentAlignmentEncoder
 from .alignment_handler import AlignmentHandler

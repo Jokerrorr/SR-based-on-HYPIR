@@ -1,37 +1,49 @@
 """
-Stage 1 Alignment Pretraining Trainer.
+Stage 1 Alignment Pretraining Trainer (v4 FaithDiff-style).
 
 Loads HYPIR pretrained LoRA (frozen), only trains Alignment Handler parameters.
-Uses the same adversarial training framework as SD2AlignmentTrainer,
-but the generator's only learnable components are the alignment module.
+Uses L1 noise prediction loss — FaithDiff dual-side alignment.
+No discriminator or LPIPS — single-step noise prediction optimization.
 
-Purpose: Let the alignment module learn to extract useful features from
-x_en (VAE-encoded RM output) based on HYPIR's existing restoration ability.
-
-After Stage 1, save alignment weights for Stage 2 initialization.
+Training flow:
+  GT → VAE.encode → z_hq → add_noise(t=200) → x_hq_t ─┐
+                                                         ├→ AlignmentModule → aligned → UNet → noise_pred
+  RM(LQ) → VAE.encode → z_lq ──────────────────────────┘
+  Loss = L1(noise_pred, noise)
 """
 
 import os
 import csv
 import logging
-from typing import List, Dict
 
 import torch
 import torch.nn.functional as F
 from accelerate.logging import get_logger
-from diffusers import DDPMScheduler, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer
-from torchvision.utils import make_grid
+from diffusers import UNet2DConditionModel
 
 from HYPIR.trainer.sd2_alignment import SD2AlignmentTrainer
 from HYPIR.alignment.alignment_handler import AlignmentHandler
 from HYPIR.model.unet_alignment import UNetAlignment
+from HYPIR.utils.common import print_vram_state
 
 logger = get_logger(__name__, log_level="INFO")
 
 
 class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
-    """Stage 1: Load HYPIR pretrained LoRA (frozen), only train alignment handler."""
+    """Stage 1: Load HYPIR pretrained LoRA (frozen), only train alignment handler.
+    No discriminator, no LPIPS, no G/D alternation.
+    """
+
+    def init_models(self):
+        """Override: skip D and LPIPS for Stage 1."""
+        self.init_scheduler()
+        self.init_text_models()
+        self.init_vae()
+        self.init_rm()
+        self.init_generator()
+        # No discriminator or LPIPS for Stage 1
+        self.D = None
+        self.net_lpips = None
 
     def init_generator(self):
         from peft import LoraConfig
@@ -60,10 +72,11 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         hypir_pretrained = getattr(self.config, "hypir_pretrained_path", None)
         if hypir_pretrained is not None and os.path.exists(hypir_pretrained):
             logger.info(f"Stage 1: Loading HYPIR pretrained LoRA from {hypir_pretrained}")
-            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu")
+            pretrained_sd = torch.load(hypir_pretrained, map_location="cpu", weights_only=False)
             m, u = unet.load_state_dict(pretrained_sd, strict=False)
+            loaded_lora = sum(1 for k in unet.state_dict() if "lora" in k)
             logger.info(f"Stage 1: Loaded HYPIR LoRA: {len(pretrained_sd)} params, "
-                        f"missing: {len(m)}, unexpected: {len(u)}")
+                         f"LoRA keys: {loaded_lora}")
         else:
             logger.warning("Stage 1: No HYPIR pretrained LoRA found, using random LoRA init")
 
@@ -71,23 +84,20 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         unet.eval().requires_grad_(False)
         logger.info("Stage 1: UNet + LoRA frozen, only alignment handler is trainable")
 
-        # Create alignment handler (same as parent)
+        # Create alignment handler (v4: dual-side alignment)
         alignment_cfg = getattr(self.config, "alignment", None)
         if alignment_cfg is not None:
             handler_kwargs = dict(
-                unet_conv_channels=320,
                 latent_channels=getattr(alignment_cfg, "latent_channels", 4),
-                encoder_block_out_channels=tuple(
-                    getattr(alignment_cfg, "encoder_block_out_channels", [128, 256, 512, 512])
+                hidden_channels=128,
+                encoder_channels=tuple(
+                    getattr(alignment_cfg, "encoder_block_out_channels", [128, 256, 512])
                 ),
-                transformer_layers=getattr(alignment_cfg, "transformer_layers", 2),
-                transformer_dim=getattr(alignment_cfg, "transformer_dim", 640),
-                transformer_heads=getattr(alignment_cfg, "transformer_heads", 8),
-                use_condition_embedding=getattr(alignment_cfg, "use_condition_embedding", True),
-                add_sample=getattr(alignment_cfg, "add_sample", True),
+                num_layers=getattr(alignment_cfg, "transformer_layers", 2),
+                num_heads=getattr(alignment_cfg, "transformer_heads", 8),
             )
         else:
-            handler_kwargs = dict(unet_conv_channels=320)
+            handler_kwargs = dict()
 
         handler = AlignmentHandler(**handler_kwargs)
 
@@ -105,13 +115,13 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
 
     def init_optimizers(self):
         """Only alignment handler params in G optimizer."""
-        logger.info(f"Stage 1: Creating {self.config.optimizer_type} optimizers (alignment only)")
+        logger.info(f"Stage 1: Creating {self.config.optimizer_type} optimizer (alignment only)")
         if self.config.optimizer_type == "adam":
             optimizer_cls = torch.optim.AdamW
         elif self.config.optimizer_type == "rmsprop":
             optimizer_cls = torch.optim.RMSprop
         else:
-            optimizer_cls = None
+            optimizer_cls = torch.optim.AdamW
 
         # Only alignment handler parameters
         align_lr = getattr(self.config, "alignment_lr", self.config.lr_G)
@@ -124,12 +134,69 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
             **self.config.opt_kwargs,
         )
 
-        self.D_params = list(filter(lambda p: p.requires_grad, self.D.parameters()))
-        self.D_opt = optimizer_cls(
-            self.D_params,
-            lr=self.config.lr_D,
-            **self.config.opt_kwargs,
+        # No D optimizer
+        self.D_params = []
+        self.D_opt = None
+
+    def prepare_all(self):
+        """Override: only prepare G, G_opt, dataloader (no D)."""
+        logger.info("Stage 1: Wrapping models, optimizers and dataloaders (no D)")
+        attrs = ["G", "G_opt", "dataloader"]
+        prepared_objs = self.accelerator.prepare(
+            self.G, self.G_opt, self.dataloader
         )
+        for attr, obj in zip(attrs, prepared_objs):
+            setattr(self, attr, obj)
+        print_vram_state("After accelerator.prepare", logger=logger)
+
+    def forward_generator(self) -> torch.Tensor:
+        """Stage 1: Return noise_pred directly (no VAE decode needed)."""
+        noise_pred = self.G(
+            self.batch_inputs.x_hq_t,
+            self.batch_inputs.timesteps,
+            encoder_hidden_states=self.batch_inputs.c_txt["text_embed"],
+            z_lq=self.batch_inputs.z_lq,
+            x_hq_t=self.batch_inputs.x_hq_t,
+        ).sample
+        return noise_pred
+
+    def optimize_generator(self):
+        """Stage 1: L1 noise prediction loss only."""
+        with self.accelerator.accumulate(self.G):
+            noise_pred = self.forward_generator()
+            noise = self.batch_inputs.noise
+
+            loss = F.l1_loss(noise_pred.float(), noise.float(), reduction="mean")
+
+            self.accelerator.backward(loss)
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.G_params, self.config.max_grad_norm)
+            self.G_opt.step()
+            self.G_opt.zero_grad()
+
+        loss_dict = dict(noise_loss=loss)
+        return loss_dict
+
+    def optimize_discriminator(self):
+        """No-op: no discriminator for Stage 1."""
+        return {}
+
+    def on_training_start(self):
+        """Initialize EMA and CSV logger for Stage 1."""
+        super().on_training_start()
+        self.loss_csv_path = os.path.join(self.config.output_dir, "loss_log.csv")
+        if self.accelerator.is_main_process:
+            with open(self.loss_csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["step", "noise_loss"])
+
+    def log_loss_to_csv(self, step: int, train_loss: dict):
+        if not self.accelerator.is_main_process:
+            return
+        row = [step, train_loss.get("noise_loss", "")]
+        with open(self.loss_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
 
     def attach_accelerator_hooks(self):
         """Save only alignment handler weights."""
@@ -150,31 +217,75 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
 
         def load_model_hook(models, input_dir):
             model = models.pop()
-            state_dict = torch.load(os.path.join(input_dir, "state_dict.pth"))
+            state_dict = torch.load(
+                os.path.join(input_dir, "state_dict.pth"),
+                map_location="cpu", weights_only=False,
+            )
             m, u = model.load_state_dict(state_dict, strict=False)
             logger.info(f"Stage 1: Loading alignment params, missing: {len(m)}, unexpected: {len(u)}")
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
+    def run(self):
+        """Stage 1: Simplified loop without G/D alternation."""
+        self.attach_accelerator_hooks()
+        self.on_training_start()
+        self.batch_count = 0
+        while self.global_step < self.config.max_train_steps:
+            train_loss = {}
+            for batch in self.dataloader:
+                self.prepare_batch_inputs(batch)
+
+                # Single optimization step (no G/D alternation)
+                loss_dict = self.optimize_generator()
+
+                bs = len(self.batch_inputs.lq)
+                for k, v in loss_dict.items():
+                    avg_loss = self.accelerator.gather(v.repeat(bs)).mean()
+                    if k not in train_loss:
+                        train_loss[k] = 0
+                    train_loss[k] += avg_loss.item()
+
+                self.batch_count += 1
+                if self.accelerator.sync_gradients:
+                    self.ema_handler.update()
+                    _, _, peak = print_vram_state(None)
+                    self.pbar.set_description(f"Step, VRAM peak: {peak:.2f} GB")
+
+                    self.global_step += 1
+                    self.pbar.update(1)
+                    self.log_loss_to_csv(self.global_step, train_loss)
+
+                    log_dict = {}
+                    for k in train_loss.keys():
+                        log_dict[f"loss/{k}"] = train_loss[k]
+                    train_loss = {}
+                    self.accelerator.log(log_dict, step=self.global_step)
+
+                    if self.global_step % self.config.log_image_steps == 0 or self.global_step == 1:
+                        self.log_images()
+                    if self.global_step % self.config.log_grad_steps == 0 or self.global_step == 1:
+                        self.log_grads()
+                    if self.global_step % self.config.checkpointing_steps == 0 or self.global_step == 1:
+                        self.save_checkpoint()
+
+                if self.global_step >= self.config.max_train_steps:
+                    break
+        self.accelerator.end_training()
+
     def log_grads(self):
-        """Override: only log alignment handler gradients (no LoRA)."""
-        self.unwrap_model(self.D).eval().requires_grad_(False)
-        x = self.forward_generator()
-        loss_l2 = F.mse_loss(x, self.batch_inputs.gt, reduction="mean") * self.config.lambda_l2
-        loss_lpips = self.net_lpips(x, self.batch_inputs.gt).mean() * self.config.lambda_lpips
-        loss_disc = self.D(x, for_G=True).mean() * self.config.lambda_gan
-        losses = [("l2", loss_l2), ("lpips", loss_lpips), ("disc", loss_disc)]
+        """Override: only log alignment handler gradients."""
+        noise_pred = self.forward_generator()
+        loss = F.l1_loss(noise_pred.float(), self.batch_inputs.noise.float(), reduction="mean")
+
         grad_dict = {}
         self.G_opt.zero_grad()
-        for idx, (name, loss) in enumerate(losses):
-            retain_graph = idx != len(losses) - 1
-            loss.backward(retain_graph=retain_graph)
+        loss.backward()
 
-            # Only alignment handler gradients
-            for pname, param in self.G.alignment_handler.named_parameters():
-                if param.grad is not None:
-                    grad_dict[f"align_grad/{pname}_{name}"] = param.grad.norm().item()
+        for pname, param in self.G.alignment_handler.named_parameters():
+            if param.grad is not None:
+                grad_dict[f"align_grad/{pname}"] = param.grad.norm().item()
 
-            self.G_opt.zero_grad()
+        self.G_opt.zero_grad()
         self.accelerator.log(grad_dict, step=self.global_step)

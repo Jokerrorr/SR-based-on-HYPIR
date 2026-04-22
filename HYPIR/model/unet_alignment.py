@@ -1,19 +1,17 @@
 """
-UNet with alignment module integration for RM+HYPIR pipeline.
+UNet with alignment module integration for RM+HYPIR pipeline (v4).
 
-Extends diffusers' UNet2DConditionModel to inject alignment features
-after conv_in, following FaithDiff's approach.
+Extends diffusers' UNet2DConditionModel with alignment module injection
+BEFORE conv_in (FaithDiff v4 approach).
 
-The alignment input is x_en (VAE Encoder output on RM-restored image),
-not pixel-space RM output.
+v4 Architecture:
+  z_lq, x_hq_t → AlignmentModule → aligned [B, 4, H, W]
+  aligned → conv_in → down_blocks → mid_block → up_blocks → conv_out
 
-  z_lq → conv_in → [B, 320, H/8, W/8]
-                        ↓
-  x_en → AlignmentHandler → alignment_features [B, 320, H/8, W/8]
-                        ↓
-              sample = sample + feat_alpha
-                        ↓
-              down_blocks → mid_block → up_blocks → conv_out
+Key changes from v3:
+- Alignment input: dual-side (z_lq, x_hq_t) instead of single-side x_en
+- Alignment output: 4ch latent instead of 320ch feature
+- Injection point: BEFORE conv_in instead of AFTER conv_in
 """
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -36,8 +34,8 @@ class UNetAlignment(nn.Module):
     """
     Wrapper around UNet2DConditionModel with alignment module injection.
 
-    The alignment module is inserted between conv_in and down_blocks,
-    fusing VAE-encoded RM features (x_en) into the UNet feature stream.
+    v4: The alignment module is applied BEFORE conv_in, taking dual-side
+    inputs (z_lq, x_hq_t) and producing an aligned 4ch latent.
     """
 
     def __init__(
@@ -54,7 +52,8 @@ class UNetAlignment(nn.Module):
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
-        x_en: Optional[torch.FloatTensor] = None,
+        x_hq_t: Optional[torch.FloatTensor] = None,
+        z_lq: Optional[torch.FloatTensor] = None,
         class_labels: Optional[torch.Tensor] = None,
         timestep_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -66,12 +65,21 @@ class UNetAlignment(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNetAlignmentOutput, Tuple]:
-        if x_en is not None and self.alignment_handler is not None:
+        # Check if alignment should be applied
+        # Need both z_lq and x_hq_t for dual-side alignment
+        apply_alignment = (
+            z_lq is not None
+            and x_hq_t is not None
+            and self.alignment_handler is not None
+        )
+
+        if apply_alignment:
             return self._forward_with_alignment(
                 sample=sample,
                 timestep=timestep,
                 encoder_hidden_states=encoder_hidden_states,
-                x_en=x_en,
+                z_lq=z_lq,
+                x_hq_t=x_hq_t,
                 class_labels=class_labels,
                 timestep_cond=timestep_cond,
                 attention_mask=attention_mask,
@@ -84,6 +92,7 @@ class UNetAlignment(nn.Module):
                 return_dict=return_dict,
             )
         else:
+            # Standard UNet forward without alignment
             out = self.unet(
                 sample,
                 timestep,
@@ -106,25 +115,38 @@ class UNetAlignment(nn.Module):
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
-        x_en: torch.FloatTensor,
+        z_lq: torch.FloatTensor,
+        x_hq_t: torch.FloatTensor,
         **kwargs,
     ) -> Union[UNetAlignmentOutput, Tuple]:
         """
-        Forward pass with alignment module injection.
+        Forward pass with alignment module injection BEFORE conv_in.
 
-        x_en: VAE Encoder output on RM image [B, 4, H/8, W/8].
+        v4 approach:
+        1. Apply alignment: aligned = AlignmentModule(z_lq, x_hq_t)
+        2. Pass aligned through conv_in and rest of UNet
+
+        Args:
+            sample: Input sample (typically z_lq * scaling_factor).
+            z_lq: LQ latent [B, 4, H/8, W/8].
+            x_hq_t: Current HQ latent estimate [B, 4, H/8, W/8].
         """
-        original_conv_in = self.unet.conv_in
-
-        # Compute alignment features from VAE-encoded RM output
-        with torch.no_grad():
-            conv_out = original_conv_in(sample)
-
-        # Apply alignment: fuse x_en features with UNet conv_in output
-        aligned = self.alignment_handler.fuse_with_unet_features(
-            unet_sample=conv_out,
-            alignment_features=self.alignment_handler.encode_alignment_input(x_en),
+        # Apply alignment BEFORE conv_in
+        # Convert inputs to float32 for alignment handler (params are fp32)
+        handler_dtype = next(self.alignment_handler.parameters()).dtype
+        aligned = self.alignment_handler(
+            z_lq.to(dtype=handler_dtype),
+            x_hq_t.to(dtype=handler_dtype)
         )
+
+        # Cast aligned back to UNet's dtype before conv_in
+        unet_dtype = self.unet.conv_in.weight.dtype
+        aligned = aligned.to(dtype=unet_dtype)
+
+        # Compute conv_in output from aligned latent
+        # NO torch.no_grad() here - gradient must flow to alignment handler
+        original_conv_in = self.unet.conv_in
+        conv_out = original_conv_in(aligned)
 
         # Replace conv_in with identity-like module that returns pre-computed result
         class _InjectedConvIn(nn.Module):
@@ -135,12 +157,12 @@ class UNetAlignment(nn.Module):
             def forward(self, x):
                 return self.precomputed
 
-        injected = _InjectedConvIn(aligned)
+        injected = _InjectedConvIn(conv_out)
         self.unet.conv_in = injected
 
         try:
             out = self.unet(
-                sample,
+                sample,  # Pass original sample (won't be used by injected conv_in)
                 timestep,
                 encoder_hidden_states=encoder_hidden_states,
                 **kwargs,
