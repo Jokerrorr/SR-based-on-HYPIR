@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from accelerate.logging import get_logger
 from diffusers import UNet2DConditionModel
+from torchvision.utils import make_grid
 
 from HYPIR.trainer.sd2_alignment import SD2AlignmentTrainer
 from HYPIR.alignment.alignment_handler import AlignmentHandler
@@ -273,6 +274,60 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
                 if self.global_step >= self.config.max_train_steps:
                     break
         self.accelerator.end_training()
+
+    def log_images(self):
+        """Stage 1: Log LQ, GT, RM output, alignment features. No G_pred (latent-only training)."""
+        N = 4
+        image_logs = dict(
+            lq=(self.batch_inputs.lq[:N] + 1) / 2,
+            gt=(self.batch_inputs.gt[:N] + 1) / 2,
+            prompt=(self._log_txt_as_img(self.batch_inputs.prompt[:N]) + 1) / 2,
+        )
+
+        # RM intermediate output
+        if self.rm is not None:
+            with torch.no_grad():
+                lq_01 = (self.batch_inputs.lq[:N] + 1) / 2
+                x_rm = self.rm.inference(lq_01.to(self.device))
+                image_logs["x_rm"] = x_rm[:N].clamp(0, 1)
+
+        # Alignment feature heatmaps
+        with torch.no_grad():
+            handler = self.G.alignment_handler
+            z_lq = self.batch_inputs.z_lq[:N]
+            x_hq_t = self.batch_inputs.x_hq_t[:N]
+            enc = handler.alignment_module
+            x_cat = torch.cat([z_lq, x_hq_t], dim=1)
+            for block in enc.encoder:
+                x_cat = block(x_cat)
+            feat = x_cat[:, :1]
+            feat = (feat - feat.min()) / (feat.max() - feat.min() + 1e-8)
+            feat = F.interpolate(feat, size=(512, 512), mode="bilinear", align_corners=False)
+            image_logs["align_features"] = feat.expand(-1, 3, -1, -1)
+
+        if not self.accelerator.is_main_process:
+            return
+
+        for tracker in self.accelerator.trackers:
+            if tracker.name == "tensorboard":
+                for tag, images in image_logs.items():
+                    tracker.writer.add_image(
+                        f"image/{tag}",
+                        make_grid(images.float(), nrow=4),
+                        self.global_step,
+                    )
+
+        # Save to disk
+        for key, images in image_logs.items():
+            image_arrs = (images * 255.0).clamp(0, 255).to(torch.uint8) \
+                .permute(0, 2, 3, 1).contiguous().cpu().numpy()
+            save_dir = os.path.join(
+                self.config.output_dir, self.config.logging_dir, "log_images",
+                f"{self.global_step:07}", key)
+            os.makedirs(save_dir, exist_ok=True)
+            for i, img in enumerate(image_arrs):
+                from PIL import Image
+                Image.fromarray(img).save(os.path.join(save_dir, f"sample{i}.png"))
 
     def log_grads(self):
         """Override: only log alignment handler gradients."""
