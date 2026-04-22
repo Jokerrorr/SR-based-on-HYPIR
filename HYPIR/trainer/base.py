@@ -341,7 +341,7 @@ class BaseTrainer:
                     if generator_step:
                         # update EMA
                         self.ema_handler.update()
-                    state = "Generator     Step" if not generator_step else "Discriminator Step"
+                    state = "Generator     Step" if generator_step else "Discriminator Step"
                     _, _, peak = print_vram_state(None)
                     self.pbar.set_description(f"{state}, VRAM peak: {peak:.2f} GB")
 
