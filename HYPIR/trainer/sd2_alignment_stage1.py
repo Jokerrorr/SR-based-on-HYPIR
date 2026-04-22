@@ -297,7 +297,8 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
             z_lq = self.batch_inputs.z_lq[:N]
             x_hq_t = self.batch_inputs.x_hq_t[:N]
             enc = handler.alignment_module
-            x_cat = torch.cat([z_lq, x_hq_t], dim=1)
+            handler_dtype = next(handler.parameters()).dtype
+            x_cat = torch.cat([z_lq, x_hq_t], dim=1).to(dtype=handler_dtype)
             for block in enc.encoder:
                 x_cat = block(x_cat)
             feat = x_cat[:, :1]
