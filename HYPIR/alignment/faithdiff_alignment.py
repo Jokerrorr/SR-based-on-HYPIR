@@ -32,18 +32,24 @@ class QuickGELU(nn.Module):
 
 
 class ControlNetConditioningEmbedding(nn.Module):
-    """Ported from FaithDiff: 4ch latent → 320ch feature."""
+    """Ported from FaithDiff: conditioning_channels → embedding_channels feature.
+
+    FaithDiff original uses 512ch input from denoise_encoder, so GroupNorm(32) works.
+    Our z_lq is 4ch, so we use num_groups = gcd(conditioning_channels, 32) to stay compatible.
+    """
 
     def __init__(self, conditioning_embedding_channels: int = 320,
                  conditioning_channels: int = 4):
         super().__init__()
+        import math
+        num_groups = math.gcd(conditioning_channels, 32)
         self.conv_in = nn.Conv2d(
             conditioning_channels, conditioning_channels,
             kernel_size=3, padding=1,
         )
         self.norm_in = nn.GroupNorm(
             num_channels=conditioning_channels,
-            num_groups=32, eps=1e-6,
+            num_groups=num_groups, eps=1e-6,
         )
         self.conv_out = zero_module(nn.Conv2d(
             conditioning_channels, conditioning_embedding_channels,

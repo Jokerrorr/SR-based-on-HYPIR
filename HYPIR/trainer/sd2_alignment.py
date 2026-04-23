@@ -1,12 +1,12 @@
 """
-SD2 Alignment Trainer v4 — HYPIR adversarial fine-tuning with dual-side alignment.
+SD2 Alignment Trainer — HYPIR adversarial fine-tuning with FaithDiff-style alignment.
 
-Stage 2: Joint training of LoRA + AlignmentHandler with adversarial loss.
+Stage 2: Joint training of LoRA + FaithDiffAlignment with adversarial loss.
 
 Training flow:
-  GT → VAE.encode → z_hq → add_noise(t=200) → x_hq_t ─┐
-                                                         ├→ AlignmentModule → aligned → UNet → noise_pred
-  RM(LQ) → VAE.encode → z_lq ──────────────────────────┘
+  GT → VAE.encode → z_hq → add_noise(t=200) → x_hq_t → conv_in → sample_emb ─┐
+                                                                                ├→ sample_emb + feat_alpha → UNet → noise_pred
+  RM(LQ) → VAE.encode → z_lq → FaithDiffAlignment(sample_emb, z_lq) ─────────┘
 
 Loss:
   loss_G = lambda_l2    * MSE(x_pred, gt)         (pixel reconstruction)
@@ -32,7 +32,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from torchvision.utils import make_grid
 
 from HYPIR.trainer.base import BaseTrainer, BatchInput
-from HYPIR.alignment.alignment_handler import AlignmentHandler
+from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
 from HYPIR.model.unet_alignment import UNetAlignment
 from HYPIR.rm.restoration_module import RestorationModule
 from HYPIR.utils.common import print_vram_state
@@ -133,22 +133,18 @@ class SD2AlignmentTrainer(BaseTrainer):
         else:
             logger.warning("No HYPIR pretrained LoRA found, using random LoRA init")
 
-        # Create alignment handler (v4: dual-side alignment)
+        # Create FaithDiff-style alignment handler
         alignment_cfg = getattr(self.config, "alignment", None)
         if alignment_cfg is not None:
-            handler_kwargs = dict(
-                latent_channels=getattr(alignment_cfg, "latent_channels", 4),
-                hidden_channels=128,
-                encoder_channels=tuple(
-                    getattr(alignment_cfg, "encoder_block_out_channels", [128, 256, 512])
-                ),
-                num_layers=getattr(alignment_cfg, "transformer_layers", 2),
-                num_heads=getattr(alignment_cfg, "transformer_heads", 8),
+            handler = FaithDiffAlignment(
+                conditioning_channels=getattr(alignment_cfg, "conditioning_channels", 4),
+                embedding_channels=getattr(alignment_cfg, "embedding_channels", 320),
+                num_trans_channel=getattr(alignment_cfg, "num_trans_channel", 640),
+                num_trans_head=getattr(alignment_cfg, "num_trans_head", 8),
+                num_trans_layer=getattr(alignment_cfg, "num_trans_layer", 2),
             )
         else:
-            handler_kwargs = dict()
-
-        handler = AlignmentHandler(**handler_kwargs)
+            handler = FaithDiffAlignment()
 
         # Wrap UNet with alignment
         self.G = UNetAlignment(unet=unet, alignment_handler=handler)
@@ -416,15 +412,16 @@ class SD2AlignmentTrainer(BaseTrainer):
             handler = self.G.alignment_handler
             z_lq = self.batch_inputs.z_lq[:N]
             x_hq_t = self.batch_inputs.x_hq_t[:N]
-            enc = handler.alignment_module
             handler_dtype = next(handler.parameters()).dtype
-            x_cat = torch.cat([z_lq, x_hq_t], dim=1).to(dtype=handler_dtype)
-            for block in enc.encoder:
-                x_cat = block(x_cat)
-            feat = x_cat[:, :1]
+            unet_dtype = self.G.unet.conv_in.weight.dtype
+
+            sample_emb = self.G.unet.conv_in(x_hq_t.to(dtype=unet_dtype))
+            feat_alpha = handler(sample_emb.to(dtype=handler_dtype), z_lq.to(dtype=handler_dtype))
+
+            feat = feat_alpha[:, :1]
             feat = (feat - feat.min()) / (feat.max() - feat.min() + 1e-8)
             feat = F.interpolate(feat, size=(512, 512), mode="bilinear", align_corners=False)
-            image_logs["align_features"] = feat.expand(-1, 3, -1, -1)
+            image_logs["feat_alpha"] = feat.expand(-1, 3, -1, -1)
 
         if not self.accelerator.is_main_process:
             return
