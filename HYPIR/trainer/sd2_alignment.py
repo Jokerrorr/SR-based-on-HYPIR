@@ -295,11 +295,13 @@ class SD2AlignmentTrainer(BaseTrainer):
             with torch.no_grad():
                 lq_01 = (lq + 1) / 2  # [-1,1] → [0,1] for RM
                 x_rm = self.rm.inference(lq_01.to(self.device))
+                self._x_rm_cache = x_rm  # cache for log_images reuse
                 x_rm_normalized = (x_rm * 2 - 1).to(dtype=self.weight_dtype)
                 z_lq = self.vae.encode(x_rm_normalized).latent_dist.sample()
                 z_lq = z_lq * self.vae.config.scaling_factor
         else:
             with torch.no_grad():
+                self._x_rm_cache = None
                 z_lq = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample()
                 z_lq = z_lq * self.vae.config.scaling_factor
 
@@ -405,12 +407,9 @@ class SD2AlignmentTrainer(BaseTrainer):
                 image_logs["G_ema"] = (ema_x[:N] + 1) / 2
             self.ema_handler.deactivate_ema_weights()
 
-        # RM intermediate output
-        if self.rm is not None:
-            with torch.no_grad():
-                lq_01 = (self.batch_inputs.lq[:N] + 1) / 2
-                x_rm = self.rm.inference(lq_01.to(self.device))
-                image_logs["x_rm"] = x_rm[:N].clamp(0, 1)
+        # RM intermediate output (reuse cached result from prepare_batch_inputs)
+        if self.rm is not None and self._x_rm_cache is not None:
+            image_logs["x_rm"] = self._x_rm_cache[:N].clamp(0, 1)
 
         # Alignment feature heatmaps
         with torch.no_grad():
