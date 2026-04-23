@@ -1,13 +1,13 @@
 """
-Stage 1 Alignment Pretraining Trainer (FaithDiff-style).
+Stage 1 Alignment Pretraining Trainer.
 
-Loads HYPIR pretrained LoRA (frozen), only trains Alignment Handler parameters.
-Uses L1 noise prediction loss with FaithDiff-style additive injection after conv_in.
+Loads HYPIR pretrained LoRA (frozen), only trains Alignment parameters.
+Uses L1 noise prediction loss with additive injection after conv_in.
 
 Training flow:
   GT → VAE.encode → z_hq → add_noise(t=200) → x_hq_t → conv_in → sample_emb ─┐
                                                                               ├→ sample_emb + feat_alpha → UNet → noise_pred
-  RM(LQ) → VAE.encode → z_lq → FaithDiffAlignment(sample_emb, z_lq) ─────────┘
+  RM(LQ) → VAE.encode → z_lq → Alignment(sample_emb, z_lq) ──────────────────┘
   Loss = L1(noise_pred, noise)
 """
 
@@ -22,7 +22,7 @@ from diffusers import UNet2DConditionModel
 from torchvision.utils import make_grid
 
 from HYPIR.trainer.sd2_alignment import SD2AlignmentTrainer
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 from HYPIR.model.unet_alignment import UNetAlignment
 from HYPIR.utils.common import print_vram_state
 
@@ -88,7 +88,7 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         # Create FaithDiff-style alignment handler
         alignment_cfg = getattr(self.config, "alignment", None)
         if alignment_cfg is not None:
-            handler = FaithDiffAlignment(
+            handler = Alignment(
                 conditioning_channels=getattr(alignment_cfg, "conditioning_channels", 4),
                 embedding_channels=getattr(alignment_cfg, "embedding_channels", 320),
                 num_trans_channel=getattr(alignment_cfg, "num_trans_channel", 640),
@@ -96,7 +96,7 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
                 num_trans_layer=getattr(alignment_cfg, "num_trans_layer", 2),
             )
         else:
-            handler = FaithDiffAlignment()
+            handler = Alignment()
 
         # Wrap UNet with alignment
         self.G = UNetAlignment(unet=unet, alignment_handler=handler)

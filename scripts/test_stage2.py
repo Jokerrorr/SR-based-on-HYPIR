@@ -1,5 +1,5 @@
 """
-Smoke test for Stage 2: verify FaithDiffAlignment pretrained loading works.
+Smoke test for Stage 2: verify Alignment pretrained loading works.
 """
 
 import sys
@@ -10,12 +10,12 @@ import torch
 import tempfile
 from diffusers import UNet2DConditionModel
 from peft import LoraConfig
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 from HYPIR.model.unet_alignment import UNetAlignment
 
 
 def test_stage2_pretrained_loading():
-    """Simulate Stage1 → Stage2 weight transfer with FaithDiffAlignment."""
+    """Simulate Stage1 → Stage2 weight transfer with Alignment."""
     # Step 1: Create Stage1 model and save alignment weights
     unet = UNet2DConditionModel.from_pretrained(
         "checkpoints/sd2", subfolder="unet",
@@ -23,7 +23,7 @@ def test_stage2_pretrained_loading():
     )
     unet.eval().requires_grad_(False)
 
-    handler1 = FaithDiffAlignment(
+    handler1 = Alignment(
         conditioning_channels=4,
         embedding_channels=320,
         num_trans_channel=640,
@@ -54,7 +54,7 @@ def test_stage2_pretrained_loading():
         torch.save(stage1_sd, stage1_path)
         print(f"Stage1 saved: {len(stage1_sd)} alignment params")
 
-        # Step 2: Create Stage2 model (UNet + LoRA + FaithDiffAlignment)
+        # Step 2: Create Stage2 model (UNet + LoRA + Alignment)
         unet2 = UNet2DConditionModel.from_pretrained(
             "checkpoints/sd2", subfolder="unet",
             torch_dtype=torch.float32,
@@ -69,7 +69,7 @@ def test_stage2_pretrained_loading():
         )
         unet2.add_adapter(lora_cfg)
 
-        handler2 = FaithDiffAlignment(
+        handler2 = Alignment(
             conditioning_channels=4,
             embedding_channels=320,
             num_trans_channel=640,

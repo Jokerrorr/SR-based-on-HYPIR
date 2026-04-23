@@ -1,8 +1,8 @@
 """
 Model summary script using torchinfo.
 
-Verifies full FaithDiff-style alignment architecture:
-  LQ → RM → VAE Encoder → z_lq → FaithDiffAlignment → feat_alpha → additive injection after conv_in
+Verifies full alignment architecture:
+  LQ → RM → VAE Encoder → z_lq → Alignment → feat_alpha → additive injection after conv_in
 """
 
 import sys
@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from diffusers import UNet2DConditionModel
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 from HYPIR.model.unet_alignment import UNetAlignment
 
 
@@ -24,8 +24,8 @@ def main():
     unet = UNet2DConditionModel.from_config("checkpoints/sd2/unet/config.json")
     unet = unet.to(device)
 
-    # Create FaithDiff-style alignment handler
-    handler = FaithDiffAlignment(
+    # Create alignment handler
+    handler = Alignment(
         conditioning_channels=4,
         embedding_channels=320,
         num_trans_channel=640,
@@ -49,7 +49,7 @@ def main():
     print(f"  Trainable params: {unet_trainable:>12,} ({unet_trainable/1e6:.2f}M)")
 
     # Alignment handler breakdown
-    print(f"\n[FaithDiffAlignment Handler]")
+    print(f"\n[Alignment Handler]")
     for name, module in [
         ("condition_embedding", handler.condition_embedding),
         ("information_transformer", handler.information_transformer),
@@ -72,7 +72,7 @@ def main():
 
     # Dimension flow
     print("\n" + "=" * 70)
-    print("Dimension Flow (FaithDiff-style additive injection after conv_in)")
+    print("Dimension Flow (additive injection after conv_in)")
     print("=" * 70)
     print("  z_lq:                              [B, 4, 64, 64]    (VAE encode of RM output)")
     print("  condition_embedding(z_lq):         [B, 320, 64, 64]   (4ch→320ch)")
@@ -117,7 +117,7 @@ def main():
 
     # Try torchinfo
     print("\n" + "=" * 70)
-    print("torchinfo Summary (FaithDiffAlignment only)")
+    print("torchinfo Summary (Alignment only)")
     print("=" * 70)
     try:
         from torchinfo import summary

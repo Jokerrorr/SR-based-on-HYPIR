@@ -1,7 +1,7 @@
 """
-SD2 Alignment Enhancer — FaithDiff-style additive injection inference.
+SD2 Alignment Enhancer — additive injection inference.
 
-Training: FaithDiffAlignment(sample_emb, z_lq) → feat_alpha → sample_emb + feat_alpha → UNet → noise_pred
+Training: Alignment(sample_emb, z_lq) → feat_alpha → sample_emb + feat_alpha → UNet → noise_pred
 Inference: add_noise(z_lq, t=200) → conv_in → sample_emb + feat_alpha → UNet → scheduler.step → z_pred → VAE.decode → HQ
 
 Additive injection after conv_in (320ch feature space).
@@ -18,7 +18,7 @@ from PIL import Image
 from typing import Literal, List
 
 from HYPIR.enhancer.base import BaseEnhancer
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 from HYPIR.model.unet_alignment import UNetAlignment
 from HYPIR.utils.common import wavelet_reconstruction, make_tiled_fn
 
@@ -56,7 +56,7 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         unet.add_adapter(G_lora_cfg)
 
         # Create FaithDiff-style alignment handler
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4,
             embedding_channels=320,
             num_trans_channel=640,

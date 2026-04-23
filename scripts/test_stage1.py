@@ -1,8 +1,8 @@
 """
-Smoke test for Stage 1 alignment pretraining trainer (FaithDiff-style).
+Smoke test for Stage 1 alignment pretraining trainer.
 
 Verifies:
-1. FaithDiffAlignment initialization and forward pass
+1. Alignment initialization and forward pass
 2. UNetAlignment with frozen UNet (Stage 1 scenario)
 3. Only alignment params have gradients
 4. Stage 1 save/load roundtrip
@@ -14,13 +14,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 from HYPIR.model.unet_alignment import UNetAlignment
 
 
-def test_faithdiff_alignment_standalone():
-    """Test FaithDiffAlignment independently."""
-    handler = FaithDiffAlignment(
+def test_alignment_standalone():
+    """Test Alignment independently."""
+    handler = Alignment(
         conditioning_channels=4,
         embedding_channels=320,
         num_trans_channel=640,
@@ -29,14 +29,14 @@ def test_faithdiff_alignment_standalone():
     )
 
     total_params = sum(p.numel() for p in handler.parameters())
-    print(f"FaithDiffAlignment: total={total_params/1e6:.2f}M")
+    print(f"Alignment: total={total_params/1e6:.2f}M")
 
     # Forward pass
     sample_emb = torch.randn(1, 320, 64, 64)
     z_lq = torch.randn(1, 4, 64, 64)
     out = handler(sample_emb, z_lq)
     assert out.shape == (1, 320, 64, 64), f"Expected (1,320,64,64), got {out.shape}"
-    print(f"FaithDiffAlignment forward: {out.shape} OK")
+    print(f"Alignment forward: {out.shape} OK")
 
     # Zero-init check
     max_val = out.abs().max().item()
@@ -58,7 +58,7 @@ def test_unet_alignment_stage1():
     assert unet_trainable == 0, f"UNet should be frozen but has {unet_trainable} trainable params"
     print(f"UNet frozen: trainable={unet_trainable} OK")
 
-    handler = FaithDiffAlignment(
+    handler = Alignment(
         conditioning_channels=4,
         embedding_channels=320,
         num_trans_channel=640,
@@ -113,7 +113,7 @@ def test_stage1_save_load():
     )
     unet.eval().requires_grad_(False)
 
-    handler = FaithDiffAlignment(
+    handler = Alignment(
         conditioning_channels=4,
         embedding_channels=320,
         num_trans_channel=640,
@@ -155,9 +155,9 @@ def test_stage1_save_load():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Test 1: FaithDiffAlignment standalone")
+    print("Test 1: Alignment standalone")
     print("=" * 60)
-    test_faithdiff_alignment_standalone()
+    test_alignment_standalone()
 
     print()
     print("=" * 60)

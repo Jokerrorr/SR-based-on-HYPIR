@@ -1,5 +1,5 @@
-from .faithdiff_alignment import (
-    FaithDiffAlignment,
+from .alignment import (
+    Alignment,
     ControlNetConditioningEmbedding,
     ResidualAttentionBlock,
     QuickGELU,

@@ -1,8 +1,8 @@
 """
-Unit tests for FaithDiff-style alignment module.
+Unit tests for alignment module.
 
 Tests:
-1. FaithDiffAlignment dimension flow
+1. Alignment dimension flow
 2. UNetAlignment additive injection after conv_in
 3. Zero-init behavior
 4. Gradient flow with mixed dtype
@@ -18,16 +18,16 @@ import torch.nn as nn
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 from HYPIR.model.unet_alignment import UNetAlignment
 
 
-class TestFaithDiffAlignment:
-    """Test FaithDiffAlignment dimension flow."""
+class TestAlignment:
+    """Test Alignment dimension flow."""
 
     def test_output_shape(self):
         """Input sample_emb [B,320,H,W] + z_lq [B,4,H,W] → output [B,320,H,W]."""
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=320,
             num_trans_channel=640, num_trans_head=8, num_trans_layer=2,
         )
@@ -38,7 +38,7 @@ class TestFaithDiffAlignment:
 
     def test_zero_init(self):
         """With zero_init on conv_out and spatial_ch_proj, output ≈ 0."""
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=320,
             num_trans_channel=640, num_trans_head=8, num_trans_layer=2,
         )
@@ -50,7 +50,7 @@ class TestFaithDiffAlignment:
 
     def test_various_spatial_sizes(self):
         """Test with different spatial sizes."""
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=320,
             num_trans_channel=640, num_trans_head=8, num_trans_layer=2,
         )
@@ -62,7 +62,7 @@ class TestFaithDiffAlignment:
 
     def test_gradient_flow(self):
         """Gradients should flow through all parameters."""
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=320,
             num_trans_channel=640, num_trans_head=8, num_trans_layer=2,
         )
@@ -105,7 +105,7 @@ class TestUNetAlignment:
             up_block_types=("UpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
         )
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=32,
             num_trans_channel=64, num_trans_head=4, num_trans_layer=1,
         )
@@ -191,14 +191,14 @@ class TestUNetAlignment:
 class TestParameterCount:
     """Test parameter counts are reasonable."""
 
-    def test_faithdiff_alignment_params(self):
-        """FaithDiffAlignment should have ~6.78M params with default config."""
-        handler = FaithDiffAlignment(
+    def test_alignment_params(self):
+        """Alignment should have ~6.78M params with default config."""
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=320,
             num_trans_channel=640, num_trans_head=8, num_trans_layer=2,
         )
         total = sum(p.numel() for p in handler.parameters())
-        print(f"FaithDiffAlignment params: {total/1e6:.2f}M")
+        print(f"Alignment params: {total/1e6:.2f}M")
         assert 5e6 < total < 10e6, f"Unexpected param count: {total/1e6:.2f}M"
 
     def test_gradient_propagation_after_training_step(self):
@@ -212,7 +212,7 @@ class TestParameterCount:
             up_block_types=("UpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
         )
-        handler = FaithDiffAlignment(
+        handler = Alignment(
             conditioning_channels=4, embedding_channels=32,
             num_trans_channel=64, num_trans_head=4, num_trans_layer=1,
         )

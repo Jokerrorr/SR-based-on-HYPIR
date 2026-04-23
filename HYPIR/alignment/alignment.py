@@ -1,10 +1,12 @@
 """
-FaithDiff-style alignment module for v5.
+Alignment module for additive injection after conv_in.
 
-Directly ported from FaithDiff's condition_embedding + information_transformer + spatial_ch_proj.
-Injection: additive residual after conv_in (320ch feature space).
+Components:
+  - condition_embedding: z_lq [B,4,H,W] → input_embedding [B,320,H,W]
+  - information_transformer: 2-layer transformer for feature fusion
+  - spatial_ch_proj: project to 320ch with zero_init
 
-Reference: FaithDiff/models/unet_2d_condition_vae_extension.py
+Injection: sample_emb + feat_alpha (zero_init ensures identity at start).
 """
 
 import torch
@@ -32,10 +34,9 @@ class QuickGELU(nn.Module):
 
 
 class ControlNetConditioningEmbedding(nn.Module):
-    """Ported from FaithDiff: conditioning_channels → embedding_channels feature.
+    """Condition embedding: conditioning_channels → embedding_channels.
 
-    FaithDiff original uses 512ch input from denoise_encoder, so GroupNorm(32) works.
-    Our z_lq is 4ch, so we use num_groups = gcd(conditioning_channels, 32) to stay compatible.
+    Uses GroupNorm with num_groups = gcd(conditioning_channels, 32) for compatibility.
     """
 
     def __init__(self, conditioning_embedding_channels: int = 320,
@@ -65,7 +66,7 @@ class ControlNetConditioningEmbedding(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    """Ported from FaithDiff: Transformer block with self-attention and MLP."""
+    """Transformer block with self-attention and MLP."""
 
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
@@ -84,8 +85,8 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
-class FaithDiffAlignment(nn.Module):
-    """FaithDiff-style alignment: additive injection after conv_in.
+class Alignment(nn.Module):
+    """Alignment module: additive injection after conv_in.
 
     Args:
         conditioning_channels: Input z_lq channels (default 4).

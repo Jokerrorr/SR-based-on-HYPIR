@@ -1,5 +1,5 @@
 """
-UNet with FaithDiff-style alignment injection.
+UNet with alignment injection.
 
 Additive injection AFTER conv_in: sample_emb + feat_alpha.
 Preserves the original UNet forward flow, adds a learned residual from LQ latent.
@@ -7,7 +7,7 @@ Preserves the original UNet forward flow, adds a learned residual from LQ latent
 Architecture:
   x_hq_t → conv_in → sample_emb [B, 320, H, W] ─┐
                                                     ├→ sample_emb + feat_alpha → Down/Mid/Up → noise_pred
-  z_lq → FaithDiffAlignment(sample_emb, z_lq) ─────┘
+  z_lq → Alignment(sample_emb, z_lq) ─────────────┘
 """
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -18,7 +18,7 @@ from diffusers import UNet2DConditionModel
 from diffusers.utils import BaseOutput
 from dataclasses import dataclass
 
-from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.alignment.alignment import Alignment
 
 
 @dataclass
@@ -35,7 +35,7 @@ class UNetAlignment(nn.Module):
     def __init__(
         self,
         unet: UNet2DConditionModel,
-        alignment_handler: FaithDiffAlignment,
+        alignment_handler: Alignment,
     ):
         super().__init__()
         self.unet = unet
@@ -113,7 +113,7 @@ class UNetAlignment(nn.Module):
         """FaithDiff-style forward: additive injection after conv_in.
 
         1. sample_emb = conv_in(x_hq_t)
-        2. feat_alpha = FaithDiffAlignment(sample_emb, z_lq)
+        2. feat_alpha = Alignment(sample_emb, z_lq)
         3. sample_emb = sample_emb + feat_alpha
         4. Continue UNet forward with injected sample_emb
         """

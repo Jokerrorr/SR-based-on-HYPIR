@@ -79,8 +79,8 @@ class ResidualAttentionBlock_Orig(nn.Module):
 
 # ========== 当前实现 ==========
 
-from HYPIR.alignment.faithdiff_alignment import (
-    FaithDiffAlignment,
+from HYPIR.alignment.alignment import (
+    Alignment,
     ControlNetConditioningEmbedding,
     ResidualAttentionBlock,
 )
@@ -123,7 +123,7 @@ def test_residual_attention_block():
 def test_spatial_ch_proj():
     print("\n=== spatial_ch_proj ===")
     orig = zero_module(nn.Linear(640, 320))
-    ours = FaithDiffAlignment().spatial_ch_proj
+    ours = Alignment().spatial_ch_proj
     sd_orig = orig.state_dict()
     sd_ours = ours.state_dict()
 
@@ -142,7 +142,7 @@ def test_full_forward():
     sample_emb = torch.randn(B, 320, H, W)
     z_lq = torch.randn(B, 4, H, W)
 
-    model = FaithDiffAlignment(
+    model = Alignment(
         conditioning_channels=4,
         embedding_channels=320,
         num_trans_channel=640,
@@ -184,7 +184,7 @@ def test_injection_logic():
     sample_emb = torch.randn(B, 320, H, W)
     z_lq = torch.randn(B, 4, H, W)
 
-    model = FaithDiffAlignment()
+    model = Alignment()
     feat_alpha = model(sample_emb, z_lq)
 
     # Simulate FaithDiff injection: sample = sample + feat_alpha
@@ -199,7 +199,7 @@ def test_injection_logic():
 def test_param_count():
     """对比参数量与 FaithDiff 原始设定。"""
     print("\n=== Parameter Count ===")
-    model = FaithDiffAlignment()
+    model = Alignment()
 
     # Breakdown
     ce_params = sum(p.numel() for p in model.condition_embedding.parameters())
