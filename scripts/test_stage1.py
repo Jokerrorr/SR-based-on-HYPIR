@@ -1,11 +1,11 @@
 """
-Smoke test for Stage 1 alignment pretraining trainer.
+Smoke test for Stage 1 alignment pretraining trainer (FaithDiff-style).
 
 Verifies:
-1. Model initialization (frozen UNet, trainable alignment only)
-2. Parameter counts match expectations
-3. Forward pass produces correct output shape
-4. Only alignment params have gradients
+1. FaithDiffAlignment initialization and forward pass
+2. UNetAlignment with frozen UNet (Stage 1 scenario)
+3. Only alignment params have gradients
+4. Stage 1 save/load roundtrip
 """
 
 import sys
@@ -14,55 +14,39 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from omegaconf import OmegaConf
-
-# Minimal config for testing (no real data/models needed for structure check)
-cfg = OmegaConf.create({
-    "base_model_path": "checkpoints/sd2",
-    "gradient_checkpointing": False,
-    "alignment": {
-        "enabled": True,
-        "latent_channels": 4,
-        "encoder_block_out_channels": [128, 256, 512, 512],
-        "transformer_layers": 2,
-        "transformer_dim": 640,
-        "transformer_heads": 8,
-        "use_condition_embedding": True,
-        "add_sample": True,
-    },
-})
+from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
+from HYPIR.model.unet_alignment import UNetAlignment
 
 
-def test_alignment_handler_only():
-    """Test alignment handler independently."""
-    from HYPIR.alignment.alignment_handler import AlignmentHandler
-
-    handler = AlignmentHandler(
-        unet_conv_channels=320,
-        latent_channels=4,
-        encoder_block_out_channels=(128, 256, 512, 512),
-        transformer_layers=2,
-        transformer_dim=640,
-        transformer_heads=8,
+def test_faithdiff_alignment_standalone():
+    """Test FaithDiffAlignment independently."""
+    handler = FaithDiffAlignment(
+        conditioning_channels=4,
+        embedding_channels=320,
+        num_trans_channel=640,
+        num_trans_head=8,
+        num_trans_layer=2,
     )
 
     total_params = sum(p.numel() for p in handler.parameters())
-    trainable_params = sum(p.numel() for p in handler.parameters() if p.requires_grad)
-    print(f"AlignmentHandler: total={total_params/1e6:.2f}M, trainable={trainable_params/1e6:.2f}M")
+    print(f"FaithDiffAlignment: total={total_params/1e6:.2f}M")
 
     # Forward pass
-    x_en = torch.randn(1, 4, 64, 64)
-    unet_sample = torch.randn(1, 320, 64, 64)
-    out = handler(x_en, unet_sample)
+    sample_emb = torch.randn(1, 320, 64, 64)
+    z_lq = torch.randn(1, 4, 64, 64)
+    out = handler(sample_emb, z_lq)
     assert out.shape == (1, 320, 64, 64), f"Expected (1,320,64,64), got {out.shape}"
-    print(f"AlignmentHandler forward: {out.shape} OK")
+    print(f"FaithDiffAlignment forward: {out.shape} OK")
+
+    # Zero-init check
+    max_val = out.abs().max().item()
+    assert max_val < 1e-6, f"Zero-init failed: max abs = {max_val}"
+    print(f"Zero-init: max abs = {max_val:.2e} OK")
 
 
-def test_unet_alignment_no_lora():
-    """Test UNetAlignment without LoRA (Stage 1 scenario)."""
+def test_unet_alignment_stage1():
+    """Test UNetAlignment with frozen UNet (Stage 1 scenario)."""
     from diffusers import UNet2DConditionModel
-    from HYPIR.alignment.alignment_handler import AlignmentHandler
-    from HYPIR.model.unet_alignment import UNetAlignment
 
     unet = UNet2DConditionModel.from_pretrained(
         "checkpoints/sd2", subfolder="unet",
@@ -70,18 +54,16 @@ def test_unet_alignment_no_lora():
     )
     unet.eval().requires_grad_(False)
 
-    # Verify UNet is frozen
     unet_trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     assert unet_trainable == 0, f"UNet should be frozen but has {unet_trainable} trainable params"
     print(f"UNet frozen: trainable={unet_trainable} OK")
 
-    handler = AlignmentHandler(
-        unet_conv_channels=320,
-        latent_channels=4,
-        encoder_block_out_channels=(128, 256, 512, 512),
-        transformer_layers=2,
-        transformer_dim=640,
-        transformer_heads=8,
+    handler = FaithDiffAlignment(
+        conditioning_channels=4,
+        embedding_channels=320,
+        num_trans_channel=640,
+        num_trans_head=8,
+        num_trans_layer=2,
     )
 
     G = UNetAlignment(unet=unet, alignment_handler=handler)
@@ -92,21 +74,22 @@ def test_unet_alignment_no_lora():
     print(f"UNetAlignment trainable: {G_trainable/1e6:.2f}M (should equal handler: {handler_params/1e6:.2f}M)")
     assert G_trainable == handler_params, "Trainable params should only be alignment handler"
 
-    # Forward pass
-    z_in = torch.randn(1, 4, 64, 64)
+    # Forward pass (additive injection after conv_in)
+    z_lq = torch.randn(1, 4, 64, 64)
+    x_hq_t = torch.randn(1, 4, 64, 64)
     timesteps = torch.tensor([200])
     text_embed = torch.randn(1, 77, 1024)
-    x_en = torch.randn(1, 4, 64, 64)
 
     with torch.no_grad():
-        eps = G(z_in, timesteps, encoder_hidden_states=text_embed, x_en=x_en).sample
+        eps = G(z_lq, timesteps, encoder_hidden_states=text_embed,
+                z_lq=z_lq, x_hq_t=x_hq_t).sample
     assert eps.shape == (1, 4, 64, 64), f"Expected (1,4,64,64), got {eps.shape}"
-    print(f"UNetAlignment forward (no LoRA): {eps.shape} OK")
+    print(f"UNetAlignment forward: {eps.shape} OK")
 
     # Gradient check — only alignment should have gradients
     G.zero_grad()
-    z_in = torch.randn(1, 4, 64, 64)
-    eps = G(z_in, timesteps, encoder_hidden_states=text_embed, x_en=x_en).sample
+    eps = G(z_lq, timesteps, encoder_hidden_states=text_embed,
+            z_lq=z_lq, x_hq_t=x_hq_t).sample
     loss = eps.mean()
     loss.backward()
 
@@ -114,17 +97,15 @@ def test_unet_alignment_no_lora():
     unet_grads = sum(1 for p in unet.parameters() if p.grad is not None)
     total_handler = sum(1 for _ in handler.parameters())
     print(f"Gradient flow: alignment={align_grads}/{total_handler}, UNet={unet_grads}")
-    assert align_grads == total_handler, f"All alignment params should have gradients"
-    assert unet_grads == 0, f"UNet should have zero gradients"
+    assert align_grads == total_handler, "All alignment params should have gradients"
+    assert unet_grads == 0, "UNet should have zero gradients"
     print("Gradient flow: OK")
 
 
 def test_stage1_save_load():
     """Test that Stage1 save/load only handles alignment weights."""
     from diffusers import UNet2DConditionModel
-    from HYPIR.alignment.alignment_handler import AlignmentHandler
-    from HYPIR.model.unet_alignment import UNetAlignment
-    import tempfile, os
+    import tempfile
 
     unet = UNet2DConditionModel.from_pretrained(
         "checkpoints/sd2", subfolder="unet",
@@ -132,9 +113,12 @@ def test_stage1_save_load():
     )
     unet.eval().requires_grad_(False)
 
-    handler = AlignmentHandler(
-        unet_conv_channels=320,
-        latent_channels=4,
+    handler = FaithDiffAlignment(
+        conditioning_channels=4,
+        embedding_channels=320,
+        num_trans_channel=640,
+        num_trans_head=8,
+        num_trans_layer=2,
     )
     G = UNetAlignment(unet=unet, alignment_handler=handler)
 
@@ -148,7 +132,13 @@ def test_stage1_save_load():
         print(f"Saved {len(state_dict)} alignment params")
 
         # Create new model and load
-        handler2 = AlignmentHandler(unet_conv_channels=320, latent_channels=4)
+        handler2 = FaithDiffAlignment(
+            conditioning_channels=4,
+            embedding_channels=320,
+            num_trans_channel=640,
+            num_trans_head=8,
+            num_trans_layer=2,
+        )
         G2 = UNetAlignment(unet=unet, alignment_handler=handler2)
 
         loaded_sd = torch.load(save_path, map_location="cpu")
@@ -157,8 +147,6 @@ def test_stage1_save_load():
         print(f"Loaded {len(align_sd)} params, missing: {len(m)}, unexpected: {len(u)}")
 
         # Verify weights match
-        for name in handler.named_parameters():
-            pass  # just iterate
         for (n1, p1), (n2, p2) in zip(handler.named_parameters(), handler2.named_parameters()):
             assert n1 == n2
             assert torch.equal(p1, p2), f"Mismatch at {n1}"
@@ -167,15 +155,15 @@ def test_stage1_save_load():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Test 1: AlignmentHandler standalone")
+    print("Test 1: FaithDiffAlignment standalone")
     print("=" * 60)
-    test_alignment_handler_only()
+    test_faithdiff_alignment_standalone()
 
     print()
     print("=" * 60)
-    print("Test 2: UNetAlignment without LoRA (Stage 1)")
+    print("Test 2: UNetAlignment with frozen UNet (Stage 1)")
     print("=" * 60)
-    test_unet_alignment_no_lora()
+    test_unet_alignment_stage1()
 
     print()
     print("=" * 60)

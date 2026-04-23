@@ -1,5 +1,5 @@
 """
-Smoke test for Stage 2: verify alignment pretrained loading works.
+Smoke test for Stage 2: verify FaithDiffAlignment pretrained loading works.
 """
 
 import sys
@@ -10,12 +10,12 @@ import torch
 import tempfile
 from diffusers import UNet2DConditionModel
 from peft import LoraConfig
-from HYPIR.alignment.alignment_handler import AlignmentHandler
+from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
 from HYPIR.model.unet_alignment import UNetAlignment
 
 
 def test_stage2_pretrained_loading():
-    """Simulate Stage1 → Stage2 weight transfer."""
+    """Simulate Stage1 → Stage2 weight transfer with FaithDiffAlignment."""
     # Step 1: Create Stage1 model and save alignment weights
     unet = UNet2DConditionModel.from_pretrained(
         "checkpoints/sd2", subfolder="unet",
@@ -23,16 +23,22 @@ def test_stage2_pretrained_loading():
     )
     unet.eval().requires_grad_(False)
 
-    handler1 = AlignmentHandler(unet_conv_channels=320, latent_channels=4)
+    handler1 = FaithDiffAlignment(
+        conditioning_channels=4,
+        embedding_channels=320,
+        num_trans_channel=640,
+        num_trans_head=8,
+        num_trans_layer=2,
+    )
     G1 = UNetAlignment(unet=unet, alignment_handler=handler1)
 
     # Run a forward pass to make weights non-trivial
     z_in = torch.randn(1, 4, 64, 64)
+    x_hq_t = torch.randn(1, 4, 64, 64)
     t = torch.tensor([200])
     text = torch.randn(1, 77, 1024)
-    x_en = torch.randn(1, 4, 64, 64)
     with torch.no_grad():
-        _ = G1(z_in, t, encoder_hidden_states=text, x_en=x_en)
+        _ = G1(z_in, t, encoder_hidden_states=text, z_lq=z_in, x_hq_t=x_hq_t)
 
     # Simulate Stage1 training (modify alignment weights slightly)
     with torch.no_grad():
@@ -48,7 +54,7 @@ def test_stage2_pretrained_loading():
         torch.save(stage1_sd, stage1_path)
         print(f"Stage1 saved: {len(stage1_sd)} alignment params")
 
-        # Step 2: Create Stage2 model (UNet + LoRA + Alignment)
+        # Step 2: Create Stage2 model (UNet + LoRA + FaithDiffAlignment)
         unet2 = UNet2DConditionModel.from_pretrained(
             "checkpoints/sd2", subfolder="unet",
             torch_dtype=torch.float32,
@@ -63,7 +69,13 @@ def test_stage2_pretrained_loading():
         )
         unet2.add_adapter(lora_cfg)
 
-        handler2 = AlignmentHandler(unet_conv_channels=320, latent_channels=4)
+        handler2 = FaithDiffAlignment(
+            conditioning_channels=4,
+            embedding_channels=320,
+            num_trans_channel=640,
+            num_trans_head=8,
+            num_trans_layer=2,
+        )
         G2 = UNetAlignment(unet=unet2, alignment_handler=handler2)
 
         # Count trainable before loading
@@ -85,13 +97,15 @@ def test_stage2_pretrained_loading():
 
         # Verify forward pass works
         with torch.no_grad():
-            eps = G2(z_in, t, encoder_hidden_states=text, x_en=x_en).sample
+            eps = G2(z_in, t, encoder_hidden_states=text,
+                     z_lq=z_in, x_hq_t=x_hq_t).sample
         assert eps.shape == (1, 4, 64, 64), f"Expected (1,4,64,64), got {eps.shape}"
         print(f"Stage2 forward pass: {eps.shape} OK")
 
         # Verify gradient flow to both LoRA and alignment
         G2.zero_grad()
-        eps = G2(z_in, t, encoder_hidden_states=text, x_en=x_en).sample
+        eps = G2(z_in, t, encoder_hidden_states=text,
+                 z_lq=z_in, x_hq_t=x_hq_t).sample
         loss = eps.mean()
         loss.backward()
 
