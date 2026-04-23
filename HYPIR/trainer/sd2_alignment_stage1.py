@@ -187,9 +187,11 @@ class SD2AlignmentStage1Trainer(SD2AlignmentTrainer):
         super().on_training_start()
         self.loss_csv_path = os.path.join(self.config.output_dir, "loss_log.csv")
         if self.accelerator.is_main_process:
-            with open(self.loss_csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["step", "noise_loss"])
+            # Only write header if not resuming (file doesn't exist or starting fresh)
+            if self.global_step == 0 or not os.path.exists(self.loss_csv_path):
+                with open(self.loss_csv_path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["step", "noise_loss"])
 
     def log_loss_to_csv(self, step: int, train_loss: dict):
         if not self.accelerator.is_main_process:

@@ -5,16 +5,12 @@ Alignment Module Test Script for RM+HYPIR Pipeline
 Ablation study modes (HYPIR is always the baseline):
 1. baseline: HYPIR only (no RM, no alignment) - control group
 2. rm: RM + HYPIR (no alignment)
-3. align: HYPIR + alignment (no RM)
-4. full: RM + alignment + HYPIR (complete pipeline)
+3. full: RM + alignment + HYPIR (complete pipeline)
 
 Usage examples:
-  # Single mode test
-  python test_alignment.py --mode baseline --input examples/lq/ --output results/baseline/
-  python test_alignment.py --mode full --input examples/lq/ --output results/full/
-
-  # Run ablation study (all modes)
-  bash test_alignment.sh
+  python test_alignment.py --mode baseline --input examples/lq/ --output results/baseline_bid/
+  python test_alignment.py --mode rm --rm_task bsr --input examples/lq/ --output results/rm_bsr/
+  python test_alignment.py --mode full --input examples/lq/ --output results/full_bid/
 """
 
 import argparse
@@ -28,7 +24,6 @@ from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Import modules
 try:
     from HYPIR.rm.restoration_module import RestorationModule
     RM_AVAILABLE = True
@@ -68,12 +63,10 @@ DEFAULT_LORA_MODULES = [
 def parse_args():
     parser = argparse.ArgumentParser(description="Test Alignment Module - Ablation Study")
 
-    # Mode selection: HYPIR baseline + RM/alignment ablation
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["baseline", "rm", "align", "full"],
-                        help="Test mode: baseline(HYPIR only), rm(RM+HYPIR), align(HYPIR+align), full(RM+align+HYPIR)")
+                        choices=["baseline", "rm", "full"],
+                        help="baseline(HYPIR only), rm(RM+HYPIR), full(RM+align+HYPIR)")
 
-    # Input/Output
     parser.add_argument("--input", type=str, required=True,
                         help="Input image directory or single image file")
     parser.add_argument("--output", type=str, required=True,
@@ -99,6 +92,12 @@ def parse_args():
                         choices=["bid", "bfr", "bsr"],
                         help="RM task type")
 
+    # Separate upscale for RM and HYPIR stages
+    parser.add_argument("--rm_upscale", type=float, default=None,
+                        help="RM upscale factor (default: 4.0 for bsr, 1.0 otherwise)")
+    parser.add_argument("--hypir_upscale", type=float, default=None,
+                        help="HYPIR upscale factor (default: 1.0 for bsr, 4.0 otherwise)")
+
     # HYPIR settings
     parser.add_argument("--lora_modules", type=str, default=",".join(DEFAULT_LORA_MODULES),
                         help="Comma-separated LoRA module names")
@@ -118,8 +117,6 @@ def parse_args():
                         help="Patch size for HYPIR processing")
     parser.add_argument("--stride", type=int, default=256,
                         help="Stride for HYPIR processing")
-    parser.add_argument("--upscale", type=int, default=4,
-                        help="Upscale factor")
     parser.add_argument("--scale_by", type=str, default="factor",
                         choices=["factor", "longest_side"],
                         help="Scaling method")
@@ -127,8 +124,6 @@ def parse_args():
                         help="Target longest side for scaling")
 
     # Prompt settings
-    parser.add_argument("--prompt", type=str, default="",
-                        help="Text prompt (empty for captioner)")
     parser.add_argument("--captioner", type=str, default="empty",
                         choices=["empty", "fixed"],
                         help="Captioner type")
@@ -143,7 +138,15 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=231,
                         help="Random seed")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Set task-specific default upscale values
+    if args.rm_upscale is None:
+        args.rm_upscale = 4.0 if args.rm_task == "bsr" else 1.0
+    if args.hypir_upscale is None:
+        args.hypir_upscale = 1.0 if args.rm_task == "bsr" else 4.0
+
+    return args
 
 
 def find_images(input_path: str) -> list:
@@ -183,16 +186,11 @@ def get_prompt(args, img_path, captioner, img):
             with open(prompt_path, "r") as fp:
                 return fp.read().strip()
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
-    elif args.prompt:
-        return args.prompt
-    return captioner(img) if captioner else ""
+    return ""
 
 
 def test_baseline(args, images, output_dir):
-    """
-    Mode: baseline - HYPIR only (no RM, no alignment)
-    Control group for ablation study.
-    """
+    """baseline: HYPIR only (no RM, no alignment)"""
     if not HYPIR_AVAILABLE:
         raise ImportError("HYPIR modules not available")
 
@@ -200,6 +198,7 @@ def test_baseline(args, images, output_dir):
     print("Mode: BASELINE (HYPIR only, no RM, no alignment)")
     print(f"Base model: {args.base_model_path}")
     print(f"HYPIR weights: {args.hypir_weight_path}")
+    print(f"HYPIR upscale: {args.hypir_upscale}")
     print(f"Input: {len(images)} images")
     print("=" * 60)
 
@@ -225,15 +224,13 @@ def test_baseline(args, images, output_dir):
         lq_tensor = to_tensor(img).unsqueeze(0).to(args.device)
         prompt = get_prompt(args, img_path, captioner, img)
 
-        print(f"  Prompt: {prompt[:50]}..." if len(prompt) > 50 else f"  Prompt: {prompt}")
-
         start_time = time()
         with torch.no_grad():
             result = model.enhance(
                 lq=lq_tensor,
                 prompt=prompt,
                 scale_by=args.scale_by,
-                upscale=args.upscale,
+                upscale=args.hypir_upscale,
                 target_longest_side=args.target_longest_side,
                 patch_size=args.patch_size,
                 stride=args.stride,
@@ -242,7 +239,7 @@ def test_baseline(args, images, output_dir):
         proc_time = time() - start_time
 
         rel_path = img_path.relative_to(args.input) if Path(args.input).is_dir() else Path(img_path.name)
-        output_path = output_dir / rel_path.with_suffix(".png")
+        output_path = output_dir / "final" / rel_path.with_suffix(".png")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path)
 
@@ -251,10 +248,7 @@ def test_baseline(args, images, output_dir):
 
 
 def test_rm(args, images, output_dir):
-    """
-    Mode: rm - RM + HYPIR (no alignment)
-    Test RM contribution on top of HYPIR baseline.
-    """
+    """rm: RM + HYPIR (no alignment)"""
     if not RM_AVAILABLE or not HYPIR_AVAILABLE:
         raise ImportError("RM and HYPIR modules required")
 
@@ -262,7 +256,9 @@ def test_rm(args, images, output_dir):
     print("Mode: RM + HYPIR (no alignment)")
     print(f"RM task: {args.rm_task}")
     print(f"RM weights: {args.rm_weight_path}")
+    print(f"RM upscale: {args.rm_upscale}")
     print(f"HYPIR weights: {args.hypir_weight_path}")
+    print(f"HYPIR upscale: {args.hypir_upscale}")
     print(f"Input: {len(images)} images")
     print("=" * 60)
 
@@ -295,7 +291,7 @@ def test_rm(args, images, output_dir):
             image=img,
             tile_size=args.tile_size,
             tile_stride=args.tile_stride,
-            ensure_min_size=True,
+            ensure_min_size=False,
         )
         rm_time = time() - start_time
 
@@ -308,7 +304,6 @@ def test_rm(args, images, output_dir):
 
         # Stage 2: HYPIR
         prompt = get_prompt(args, img_path, captioner, img)
-        print(f"  Prompt: {prompt[:50]}..." if len(prompt) > 50 else f"  Prompt: {prompt}")
 
         start_time = time()
         with torch.no_grad():
@@ -316,7 +311,7 @@ def test_rm(args, images, output_dir):
                 lq=rm_output,
                 prompt=prompt,
                 scale_by=args.scale_by,
-                upscale=args.upscale,
+                upscale=args.hypir_upscale,
                 target_longest_side=args.target_longest_side,
                 patch_size=args.patch_size,
                 stride=args.stride,
@@ -325,7 +320,7 @@ def test_rm(args, images, output_dir):
         hypir_time = time() - start_time
 
         rel_path = img_path.relative_to(args.input) if Path(args.input).is_dir() else Path(img_path.name)
-        output_path = output_dir / rel_path.with_suffix(".png")
+        output_path = output_dir / "final" / rel_path.with_suffix(".png")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path)
 
@@ -334,73 +329,8 @@ def test_rm(args, images, output_dir):
         print(f"  {img.size} -> RM: {rm_output.shape[2:]} -> {result.size}")
 
 
-def test_align(args, images, output_dir):
-    """
-    Mode: align - HYPIR + alignment (no RM)
-    Test alignment contribution on top of HYPIR baseline.
-    """
-    if not ALIGNMENT_AVAILABLE:
-        raise ImportError("Alignment modules not available")
-
-    print("=" * 60)
-    print("Mode: HYPIR + ALIGNMENT (no RM)")
-    print(f"Base model: {args.base_model_path}")
-    print(f"Alignment weights: {args.alignment_weight_path}")
-    print(f"Input: {len(images)} images")
-    print("=" * 60)
-
-    print("Loading Alignment model...")
-    model = SD2AlignmentEnhancer(
-        base_model_path=args.base_model_path,
-        weight_path=args.alignment_weight_path,
-        lora_modules=args.lora_modules.split(","),
-        lora_rank=args.lora_rank,
-        model_t=args.model_t,
-        coeff_t=args.coeff_t,
-        device=args.device,
-    )
-    model.init_models()
-
-    captioner = get_captioner(args)
-    to_tensor = transforms.ToTensor()
-
-    for img_path in images:
-        print(f"\nProcessing: {img_path.name}")
-
-        img = Image.open(img_path).convert("RGB")
-        lq_tensor = to_tensor(img).unsqueeze(0).to(args.device)
-        prompt = get_prompt(args, img_path, captioner, img)
-
-        print(f"  Prompt: {prompt[:50]}..." if len(prompt) > 50 else f"  Prompt: {prompt}")
-
-        start_time = time()
-        with torch.no_grad():
-            result = model.enhance(
-                lq=lq_tensor,
-                prompt=prompt,
-                scale_by=args.scale_by,
-                upscale=args.upscale,
-                target_longest_side=args.target_longest_side,
-                patch_size=args.patch_size,
-                stride=args.stride,
-                return_type="pil",
-            )[0]
-        proc_time = time() - start_time
-
-        rel_path = img_path.relative_to(args.input) if Path(args.input).is_dir() else Path(img_path.name)
-        output_path = output_dir / rel_path.with_suffix(".png")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        result.save(output_path)
-
-        print(f"  Saved: {output_path}")
-        print(f"  Time: {proc_time:.2f}s | {img.size} -> {result.size}")
-
-
 def test_full(args, images, output_dir):
-    """
-    Mode: full - RM + alignment + HYPIR (complete pipeline)
-    Full two-stage pipeline with alignment.
-    """
+    """full: RM + alignment + HYPIR (complete pipeline)"""
     if not RM_AVAILABLE or not ALIGNMENT_AVAILABLE:
         raise ImportError("RM and Alignment modules required")
 
@@ -408,7 +338,9 @@ def test_full(args, images, output_dir):
     print("Mode: FULL (RM + Alignment + HYPIR)")
     print(f"RM task: {args.rm_task}")
     print(f"RM weights: {args.rm_weight_path}")
+    print(f"RM upscale: {args.rm_upscale}")
     print(f"Alignment weights: {args.alignment_weight_path}")
+    print(f"HYPIR upscale: {args.hypir_upscale}")
     print(f"Input: {len(images)} images")
     print("=" * 60)
 
@@ -441,7 +373,7 @@ def test_full(args, images, output_dir):
             image=img,
             tile_size=args.tile_size,
             tile_stride=args.tile_stride,
-            ensure_min_size=True,
+            ensure_min_size=False,
         )
         rm_time = time() - start_time
 
@@ -454,7 +386,6 @@ def test_full(args, images, output_dir):
 
         # Stage 2: Alignment + HYPIR
         prompt = get_prompt(args, img_path, captioner, img)
-        print(f"  Prompt: {prompt[:50]}..." if len(prompt) > 50 else f"  Prompt: {prompt}")
 
         align_model.set_rm_output(rm_output)
 
@@ -464,7 +395,7 @@ def test_full(args, images, output_dir):
                 lq=rm_output,
                 prompt=prompt,
                 scale_by=args.scale_by,
-                upscale=args.upscale,
+                upscale=args.hypir_upscale,
                 target_longest_side=args.target_longest_side,
                 patch_size=args.patch_size,
                 stride=args.stride,
@@ -473,7 +404,7 @@ def test_full(args, images, output_dir):
         align_time = time() - start_time
 
         rel_path = img_path.relative_to(args.input) if Path(args.input).is_dir() else Path(img_path.name)
-        output_path = output_dir / rel_path.with_suffix(".png")
+        output_path = output_dir / "final" / rel_path.with_suffix(".png")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path)
 
@@ -499,22 +430,21 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config
     with open(output_dir / "config.txt", "w") as f:
         f.write(f"Mode: {args.mode}\n")
+        f.write(f"RM task: {args.rm_task}\n")
+        f.write(f"RM upscale: {args.rm_upscale}\n")
+        f.write(f"HYPIR upscale: {args.hypir_upscale}\n")
         f.write(f"Input: {args.input}\n")
         f.write(f"Base model: {args.base_model_path}\n")
         f.write(f"HYPIR weights: {args.hypir_weight_path}\n")
         f.write(f"Alignment weights: {args.alignment_weight_path}\n")
-        f.write(f"RM task: {args.rm_task}\n")
         f.write(f"RM weights: {args.rm_weight_path}\n")
-        f.write(f"Upscale: {args.upscale}\n")
         f.write(f"Seed: {args.seed}\n")
 
     mode_handlers = {
         "baseline": test_baseline,
         "rm": test_rm,
-        "align": test_align,
         "full": test_full,
     }
 

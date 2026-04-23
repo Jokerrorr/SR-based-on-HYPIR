@@ -2,7 +2,7 @@
 # FaithDiff-style dual-side alignment: AlignmentModule(z_lq, x_hq_t) → aligned → UNet
 # L1 noise prediction loss
 
-output_dir: output_alignment_stage1
+output_dir: output/output_alignment_stage1
 
 data_config:
   train:
@@ -107,7 +107,7 @@ noise_offset: ~
 
 mixed_precision: bf16
 seed: 231
-max_train_steps: 10000
+max_train_steps: 20000
 gradient_accumulation_steps: 1
 gradient_checkpointing: true
 max_grad_norm: 1.0
@@ -115,7 +115,7 @@ logging_dir: logs
 report_to: tensorboard
 checkpointing_steps: 500
 checkpoints_total_limit: 2
-resume_from_checkpoint: ~
+resume_from_checkpoint: output/output_alignment_stage1/checkpoint-10000
 log_image_steps: 500
 log_grad_steps: 500
 

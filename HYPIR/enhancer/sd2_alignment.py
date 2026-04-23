@@ -153,7 +153,7 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         lq_norm = (lq * 2 - 1).to(dtype=self.weight_dtype, device=self.device)
         lq_norm = F.pad(lq_norm, (0, pw, 0, ph), mode="constant", value=0)
 
-        # --- Encode RM output for z_lq (LQ side of alignment) ---
+        # --- VAE encoding with tiled processing ---
         rm_pixel = getattr(self, "_rm_pixel", None)
         if rm_pixel is not None:
             rm_scaled = F.interpolate(
@@ -162,9 +162,20 @@ class SD2AlignmentEnhancer(BaseEnhancer):
             )
             rm_norm = (rm_scaled * 2 - 1).to(dtype=self.weight_dtype, device=self.device)
             rm_norm = F.pad(rm_norm, (0, pw, 0, ph), mode="constant", value=0)
-            z_lq_full = self.vae.encode(rm_norm).latent_dist.sample()
+            encode_input = rm_norm
         else:
-            z_lq_full = self.vae.encode(lq_norm).latent_dist.sample()
+            encode_input = lq_norm
+
+        z_lq_full = make_tiled_fn(
+            fn=lambda tile: self.vae.encode(tile).latent_dist.sample(),
+            size=patch_size,
+            stride=stride,
+            scale_type="down",
+            scale=vae_scale_factor,
+            progress=True,
+            channel=self.vae.config.latent_channels,
+            desc="VAE encoding",
+        )(encode_input.to(self.weight_dtype))
 
         self._z_lq_precomputed = z_lq_full
 

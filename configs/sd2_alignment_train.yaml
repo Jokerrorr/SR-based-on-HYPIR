@@ -2,7 +2,7 @@
 # HYPIR original loss (GAN + LPIPS + L2) + alignment noise prediction loss
 # G/D alternating training
 
-output_dir: output_alignment
+output_dir: output/output_alignment_stage2
 
 data_config:
   train:
