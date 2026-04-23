@@ -1,17 +1,13 @@
 """
-UNet with alignment module integration for RM+HYPIR pipeline (v4).
+UNet with FaithDiff-style alignment injection.
 
-Extends diffusers' UNet2DConditionModel with alignment module injection
-BEFORE conv_in (FaithDiff v4 approach).
+Additive injection AFTER conv_in: sample_emb + feat_alpha.
+Preserves the original UNet forward flow, adds a learned residual from LQ latent.
 
-v4 Architecture:
-  z_lq, x_hq_t → AlignmentModule → aligned [B, 4, H, W]
-  aligned → conv_in → down_blocks → mid_block → up_blocks → conv_out
-
-Key changes from v3:
-- Alignment input: dual-side (z_lq, x_hq_t) instead of single-side x_en
-- Alignment output: 4ch latent instead of 320ch feature
-- Injection point: BEFORE conv_in instead of AFTER conv_in
+Architecture:
+  x_hq_t → conv_in → sample_emb [B, 320, H, W] ─┐
+                                                    ├→ sample_emb + feat_alpha → Down/Mid/Up → noise_pred
+  z_lq → FaithDiffAlignment(sample_emb, z_lq) ─────┘
 """
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -22,7 +18,7 @@ from diffusers import UNet2DConditionModel
 from diffusers.utils import BaseOutput
 from dataclasses import dataclass
 
-from HYPIR.alignment.alignment_handler import AlignmentHandler
+from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
 
 
 @dataclass
@@ -31,17 +27,15 @@ class UNetAlignmentOutput(BaseOutput):
 
 
 class UNetAlignment(nn.Module):
-    """
-    Wrapper around UNet2DConditionModel with alignment module injection.
+    """Wrapper around UNet2DConditionModel with FaithDiff-style additive injection.
 
-    v4: The alignment module is applied BEFORE conv_in, taking dual-side
-    inputs (z_lq, x_hq_t) and producing an aligned 4ch latent.
+    The alignment module is applied AFTER conv_in, adding feat_alpha to sample_emb.
     """
 
     def __init__(
         self,
         unet: UNet2DConditionModel,
-        alignment_handler: AlignmentHandler,
+        alignment_handler: FaithDiffAlignment,
     ):
         super().__init__()
         self.unet = unet
@@ -65,8 +59,6 @@ class UNetAlignment(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNetAlignmentOutput, Tuple]:
-        # Check if alignment should be applied
-        # Need both z_lq and x_hq_t for dual-side alignment
         apply_alignment = (
             z_lq is not None
             and x_hq_t is not None
@@ -92,7 +84,6 @@ class UNetAlignment(nn.Module):
                 return_dict=return_dict,
             )
         else:
-            # Standard UNet forward without alignment
             out = self.unet(
                 sample,
                 timestep,
@@ -119,36 +110,30 @@ class UNetAlignment(nn.Module):
         x_hq_t: torch.FloatTensor,
         **kwargs,
     ) -> Union[UNetAlignmentOutput, Tuple]:
+        """FaithDiff-style forward: additive injection after conv_in.
+
+        1. sample_emb = conv_in(x_hq_t)
+        2. feat_alpha = FaithDiffAlignment(sample_emb, z_lq)
+        3. sample_emb = sample_emb + feat_alpha
+        4. Continue UNet forward with injected sample_emb
         """
-        Forward pass with alignment module injection BEFORE conv_in.
-
-        v4 approach:
-        1. Apply alignment: aligned = AlignmentModule(z_lq, x_hq_t)
-        2. Pass aligned through conv_in and rest of UNet
-
-        Args:
-            sample: Input sample (typically z_lq * scaling_factor).
-            z_lq: LQ latent [B, 4, H/8, W/8].
-            x_hq_t: Current HQ latent estimate [B, 4, H/8, W/8].
-        """
-        # Apply alignment BEFORE conv_in
-        # Convert inputs to float32 for alignment handler (params are fp32)
-        handler_dtype = next(self.alignment_handler.parameters()).dtype
-        aligned = self.alignment_handler(
-            z_lq.to(dtype=handler_dtype),
-            x_hq_t.to(dtype=handler_dtype)
-        )
-
-        # Cast aligned back to UNet's dtype before conv_in
+        # 1. Compute conv_in output from x_hq_t
         unet_dtype = self.unet.conv_in.weight.dtype
-        aligned = aligned.to(dtype=unet_dtype)
+        sample_emb = self.unet.conv_in(x_hq_t.to(dtype=unet_dtype))  # [B, 320, H, W]
 
-        # Compute conv_in output from aligned latent
-        # NO torch.no_grad() here - gradient must flow to alignment handler
+        # 2. Compute feat_alpha
+        handler_dtype = next(self.alignment_handler.parameters()).dtype
+        feat_alpha = self.alignment_handler(
+            sample_emb.to(dtype=handler_dtype),
+            z_lq.to(dtype=handler_dtype),
+        )  # [B, 320, H, W]
+
+        # 3. Additive injection
+        sample_emb = sample_emb + feat_alpha.to(dtype=unet_dtype)
+
+        # 4. Replace conv_in to return pre-computed result
         original_conv_in = self.unet.conv_in
-        conv_out = original_conv_in(aligned)
 
-        # Replace conv_in with identity-like module that returns pre-computed result
         class _InjectedConvIn(nn.Module):
             def __init__(self, precomputed):
                 super().__init__()
@@ -157,12 +142,11 @@ class UNetAlignment(nn.Module):
             def forward(self, x):
                 return self.precomputed
 
-        injected = _InjectedConvIn(conv_out)
-        self.unet.conv_in = injected
+        self.unet.conv_in = _InjectedConvIn(sample_emb)
 
         try:
             out = self.unet(
-                sample,  # Pass original sample (won't be used by injected conv_in)
+                sample,
                 timestep,
                 encoder_hidden_states=encoder_hidden_states,
                 **kwargs,
@@ -191,10 +175,16 @@ class UNetAlignment(nn.Module):
                 yield p
 
     def named_parameters(self, prefix: str = "", recurse: bool = True):
-        for name, p in self.unet.named_parameters(prefix="unet." + prefix if prefix else "unet.", recurse=recurse):
+        for name, p in self.unet.named_parameters(
+            prefix="unet." + prefix if prefix else "unet.", recurse=recurse
+        ):
             yield name, p
         if self.alignment_handler is not None:
-            for name, p in self.alignment_handler.named_parameters(prefix="alignment_handler." + prefix if prefix else "alignment_handler.", recurse=recurse):
+            for name, p in self.alignment_handler.named_parameters(
+                prefix="alignment_handler." + prefix
+                if prefix else "alignment_handler.",
+                recurse=recurse,
+            ):
                 yield name, p
 
     def to(self, *args, **kwargs):
@@ -216,7 +206,6 @@ class UNetAlignment(nn.Module):
         alignment_sd = {}
         for k, v in state_dict.items():
             if k.startswith("unet."):
-                # Handle double-dot keys from training: "unet..X" -> "X"
                 key = k[len("unet."):]
                 key = key.lstrip(".")
                 unet_sd[key] = v
@@ -229,11 +218,12 @@ class UNetAlignment(nn.Module):
 
         m_unet, u_unet = self.unet.load_state_dict(unet_sd, strict=False)
         if alignment_sd:
-            m_align, u_align = self.alignment_handler.load_state_dict(alignment_sd, strict=strict)
+            m_align, u_align = self.alignment_handler.load_state_dict(
+                alignment_sd, strict=strict
+            )
         else:
             m_align, u_align = [], []
         return m_unet + m_align, u_unet + u_align
 
     def get_alignment_params(self):
-        """Return only alignment handler parameters (for separate optimization)."""
         return list(self.alignment_handler.parameters())

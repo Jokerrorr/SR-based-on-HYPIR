@@ -1,10 +1,10 @@
 """
-SD2 Alignment Enhancer v4 — FaithDiff dual-side alignment inference.
+SD2 Alignment Enhancer — FaithDiff-style additive injection inference.
 
-Training: AlignmentModule(z_lq, x_hq_t) → aligned → UNet → noise_pred
-Inference: AlignmentModule(z_lq, add_noise(z_lq)) → aligned → UNet(t=200) → z_pred → VAE.decode → HQ
+Training: FaithDiffAlignment(sample_emb, z_lq) → feat_alpha → sample_emb + feat_alpha → UNet → noise_pred
+Inference: add_noise(z_lq, t=200) → conv_in → sample_emb + feat_alpha → UNet → scheduler.step → z_pred → VAE.decode → HQ
 
-v4: dual-side alignment (z_lq + x_hq_t) injected BEFORE conv_in.
+Additive injection after conv_in (320ch feature space).
 No GT at inference — use add_noise(VAE.encode(RM(LQ)), t=200) as x_hq_t approximation.
 """
 
@@ -18,7 +18,7 @@ from PIL import Image
 from typing import Literal, List
 
 from HYPIR.enhancer.base import BaseEnhancer
-from HYPIR.alignment.alignment_handler import AlignmentHandler
+from HYPIR.alignment.faithdiff_alignment import FaithDiffAlignment
 from HYPIR.model.unet_alignment import UNetAlignment
 from HYPIR.utils.common import wavelet_reconstruction, make_tiled_fn
 
@@ -55,8 +55,14 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         )
         unet.add_adapter(G_lora_cfg)
 
-        # Create alignment handler (v4: dual-side alignment)
-        handler = AlignmentHandler(latent_channels=4)
+        # Create FaithDiff-style alignment handler
+        handler = FaithDiffAlignment(
+            conditioning_channels=4,
+            embedding_channels=320,
+            num_trans_channel=640,
+            num_trans_head=8,
+            num_trans_layer=2,
+        )
 
         # Wrap into UNetAlignment
         self.G = UNetAlignment(unet=unet, alignment_handler=handler)
@@ -112,7 +118,7 @@ class SD2AlignmentEnhancer(BaseEnhancer):
         stride: int = 256,
         return_type: Literal["pt", "np", "pil"] = "pt",
     ) -> torch.Tensor | np.ndarray | List[Image.Image]:
-        """v4 inference: dual-side alignment with RM output as z_lq."""
+        """Inference: FaithDiff-style additive injection after conv_in."""
         if stride <= 0:
             raise ValueError("Stride must be greater than 0.")
         if patch_size <= 0:
@@ -220,14 +226,14 @@ class SD2AlignmentEnhancer(BaseEnhancer):
             return [Image.fromarray(img) for img in self.tensor2image(x)]
 
     def _tiled_generator_forward(self, z_lq_tile, **kwargs):
-        """v4 tiled forward: alignment(z_lq, add_noise(z_lq)) → UNet → scheduler.step."""
+        """Tiled forward: conv_in → sample_emb + feat_alpha → UNet → scheduler.step."""
         z_lq_tile = z_lq_tile * self.vae.config.scaling_factor
 
         # Approximate x_hq_t: add noise to z_lq at t=model_t
         noise = torch.randn_like(z_lq_tile)
         x_hq_t = self.scheduler.add_noise(z_lq_tile, noise, self.inputs["timesteps"])
 
-        # Dual-side alignment
+        # FaithDiff-style: additive injection after conv_in
         eps = self.G(
             z_lq_tile,
             self.inputs["timesteps"],
