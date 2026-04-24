@@ -102,3 +102,8 @@ resume_from_checkpoint: ~
 log_image_steps: 100
 log_grad_steps: 100
 log_grad_modules: [conv_out]
+
+# SeD discriminator settings
+lambda_gan_sed: 0.05
+sed_type: "P"
+sed_resize: 256
