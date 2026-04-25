@@ -99,6 +99,7 @@ report_to: tensorboard
 checkpointing_steps: 500
 checkpoints_total_limit: 2
 resume_from_checkpoint: ~
+pretrained_weight_path: checkpoints/HYPIR/HYPIR_sd2.pth
 log_image_steps: 100
 log_grad_steps: 100
 log_grad_modules: [conv_out]

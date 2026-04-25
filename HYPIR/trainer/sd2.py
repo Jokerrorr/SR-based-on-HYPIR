@@ -52,6 +52,14 @@ class SD2Trainer(BaseTrainer):
             target_modules=target_modules,
         )
         self.G.add_adapter(G_lora_cfg)
+
+        # Load pretrained LoRA weights if provided
+        if hasattr(self.config, 'pretrained_weight_path') and self.config.pretrained_weight_path:
+            logger.info(f"Loading pretrained LoRA weights from {self.config.pretrained_weight_path}")
+            state_dict = torch.load(self.config.pretrained_weight_path, map_location='cpu')
+            m, u = self.G.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded pretrained weights, missing keys: {len(m)}, unexpected keys: {len(u)}")
+
         lora_params = list(filter(lambda p: p.requires_grad, self.G.parameters()))
         assert lora_params, "Failed to find lora parameters"
         for p in lora_params:

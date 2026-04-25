@@ -62,12 +62,12 @@ L_G = 1.0 × L_mse + 5.0 × L_lpips + 0.5 × L_adv_convnext + 0.05 × L_adv_sed
 
 ### 修改文件
 - `HYPIR/trainer/base.py` — 新增 init_sed_discriminator、修改 optimize_generator / optimize_discriminator / init_optimizers / prepare_all / log_grads
-- `configs/sd2_train.yaml` — 新增 SeD 判别器配置项（lambda_gan_sed, sed_type, sed_resize）
+- `configs/sd2_train.yaml` — 新增 SeD 判别器配置项（lambda_gan_sed, sed_type, sed_resize）及预训练权重路径（pretrained_weight_path）
 
 ### 不修改的文件
 - `HYPIR/model/D.py` — 原始 ImageConvNextDiscriminator 保留不动
 - `HYPIR/model/backbone.py` — ConvNeXt 骨干保留不动
-- `HYPIR/trainer/sd2.py` — 判别器逻辑全在 base.py
+- `HYPIR/trainer/sd2.py` — 判别器逻辑全在 base.py；新增预训练 LoRA 权重加载逻辑
 - `requirements.txt` — clip、einops 已安装
 
 ## 任务阶段
