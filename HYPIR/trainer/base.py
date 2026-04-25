@@ -21,7 +21,6 @@ import diffusers
 from diffusers import AutoencoderKL
 from PIL import Image
 
-from HYPIR.model.D import ImageConvNextDiscriminator
 from HYPIR.model.sed_discriminator import CLIP_Semantic_extractor, SeD_P
 from HYPIR.utils.common import instantiate_from_config, log_txt_as_img, print_vram_state, SuppressLogging
 from HYPIR.utils.ema import EMAModel
@@ -104,7 +103,6 @@ class BaseTrainer:
         self.init_vae()
         self.init_generator()
         self.init_discriminator()
-        self.init_sed_discriminator()
         self.init_lpips()
 
     @overload
@@ -136,17 +134,6 @@ class BaseTrainer:
         ...
 
     def init_discriminator(self):
-        # Suppress logs from open-clip
-        ctx = (
-            nullcontext()
-            if self.accelerator.is_local_main_process
-            else SuppressLogging(logging.WARNING)
-        )
-        with ctx:
-            self.D = ImageConvNextDiscriminator(precision="bf16").to(device=self.device)
-        self.D.train().requires_grad_(True)
-
-    def init_sed_discriminator(self):
         ctx = (
             nullcontext()
             if self.accelerator.is_local_main_process
@@ -155,10 +142,10 @@ class BaseTrainer:
         with ctx:
             self.semantic_extractor = CLIP_Semantic_extractor().to(device=self.device)
         self.semantic_extractor.eval().requires_grad_(False)
-        self.D_sed = SeD_P(input_nc=3, ndf=64, semantic_dim=1024, semantic_size=16).to(device=self.device)
-        self.D_sed.train().requires_grad_(True)
+        self.D = SeD_P(input_nc=3, ndf=64, semantic_dim=1024, semantic_size=16).to(device=self.device)
+        self.D.train().requires_grad_(True)
 
-    def _prepare_sed_inputs(self, x):
+    def _prepare_D_inputs(self, x):
         gt = self.batch_inputs.gt
         x_256 = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
         gt_256 = F.interpolate(gt, size=(256, 256), mode='bilinear', align_corners=False)
@@ -203,13 +190,6 @@ class BaseTrainer:
             **self.config.opt_kwargs,
         )
 
-        self.D_sed_params = list(filter(lambda p: p.requires_grad, self.D_sed.parameters()))
-        self.D_sed_opt = optimizer_cls(
-            self.D_sed_params,
-            lr=self.config.lr_D,
-            **self.config.opt_kwargs,
-        )
-
     def init_dataset(self):
         data_cfg = self.config.data_config
         dataset = instantiate_from_config(data_cfg.train.dataset)
@@ -223,7 +203,7 @@ class BaseTrainer:
 
     def prepare_all(self):
         logger.info("Wrapping models, optimizers and dataloaders")
-        attrs = ["G", "D", "D_sed", "G_opt", "D_opt", "D_sed_opt", "dataloader"]
+        attrs = ["G", "D", "G_opt", "D_opt", "dataloader"]
         prepared_objs = self.accelerator.prepare(*[getattr(self, attr) for attr in attrs])
         for attr, obj in zip(attrs, prepared_objs):
             setattr(self, attr, obj)
@@ -306,28 +286,26 @@ class BaseTrainer:
     def optimize_generator(self):
         with self.accelerator.accumulate(self.G):
             self.unwrap_model(self.D).eval().requires_grad_(False)
-            self.unwrap_model(self.D_sed).eval().requires_grad_(False)
             x = self.forward_generator()
             self.G_pred = x
             loss_l2 = F.mse_loss(x, self.batch_inputs.gt, reduction="mean") * self.config.lambda_l2
             loss_lpips = self.net_lpips(x, self.batch_inputs.gt).mean() * self.config.lambda_lpips
-            loss_disc = self.D(x, for_G=True).mean() * self.config.lambda_gan
 
-            # SeD GAN loss
-            x_256, gt_256, semantic = self._prepare_sed_inputs(x)
-            sed_logits = self.D_sed(x_256, semantic)
-            loss_sed = F.binary_cross_entropy_with_logits(
+            # SeD GAN loss for G
+            x_256, gt_256, semantic = self._prepare_D_inputs(x)
+            sed_logits = self.D(x_256, semantic)
+            loss_disc = F.binary_cross_entropy_with_logits(
                 sed_logits, torch.ones_like(sed_logits)
-            ) * self.config.lambda_gan_sed
+            ) * self.config.lambda_gan
 
-            loss_G = loss_l2 + loss_lpips + loss_disc + loss_sed
+            loss_G = loss_l2 + loss_lpips + loss_disc
             self.accelerator.backward(loss_G)
             if self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(self.G_params, self.config.max_grad_norm)
             self.G_opt.step()
             self.G_opt.zero_grad()
         # Log something
-        loss_dict = dict(G_total=loss_G, G_mse=loss_l2, G_lpips=loss_lpips, G_disc=loss_disc, G_sed=loss_sed)
+        loss_dict = dict(G_total=loss_G, G_mse=loss_l2, G_lpips=loss_lpips, G_disc=loss_disc)
         return loss_dict
 
     def optimize_discriminator(self):
@@ -336,40 +314,23 @@ class BaseTrainer:
             x = self.forward_generator()
         self.G_pred = x
 
-        # ---- Original ConvNeXt D ----
+        # ---- SeD Discriminator ----
+        x_256, gt_256, semantic = self._prepare_D_inputs(x)
         with self.accelerator.accumulate(self.D):
             self.unwrap_model(self.D).train().requires_grad_(True)
-            loss_D_real, real_logits = self.D(gt, for_real=True, return_logits=True)
-            loss_D_fake, fake_logits = self.D(x, for_real=False, return_logits=True)
-            loss_D = loss_D_real.mean() + loss_D_fake.mean()
+            real_logits = self.D(gt_256, semantic)
+            fake_logits = self.D(x_256, semantic)
+            loss_D_real = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+            loss_D_fake = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+            loss_D = loss_D_real + loss_D_fake
             self.accelerator.backward(loss_D)
             if self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(self.D_params, self.config.max_grad_norm)
             self.D_opt.step()
             self.D_opt.zero_grad()
 
-        # ---- SeD D ----
-        x_256, gt_256, semantic = self._prepare_sed_inputs(x)
-        with self.accelerator.accumulate(self.D_sed):
-            self.unwrap_model(self.D_sed).train().requires_grad_(True)
-            real_logits_sed = self.D_sed(gt_256, semantic)
-            fake_logits_sed = self.D_sed(x_256, semantic)
-            loss_D_sed_real = F.binary_cross_entropy_with_logits(real_logits_sed, torch.ones_like(real_logits_sed))
-            loss_D_sed_fake = F.binary_cross_entropy_with_logits(fake_logits_sed, torch.zeros_like(fake_logits_sed))
-            loss_D_sed = loss_D_sed_real + loss_D_sed_fake
-            self.accelerator.backward(loss_D_sed)
-            if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.D_sed_params, self.config.max_grad_norm)
-            self.D_sed_opt.step()
-            self.D_sed_opt.zero_grad()
-
-        loss_dict = dict(D=loss_D, D_sed=loss_D_sed)
-        # logits = D(x) w/o sigmoid = log(p_real(x) / p_fake(x))
-        with torch.no_grad():
-            real_logits_val = torch.tensor([logit_map.mean() for logit_map in real_logits], device=self.device).mean()
-            fake_logits_val = torch.tensor([logit_map.mean() for logit_map in fake_logits], device=self.device).mean()
-        loss_dict.update(dict(D_logits_real=real_logits_val, D_logits_fake=fake_logits_val))
-        loss_dict.update(dict(D_sed_logits_real=real_logits_sed.mean(), D_sed_logits_fake=fake_logits_sed.mean()))
+        loss_dict = dict(D=loss_D)
+        loss_dict.update(dict(D_logits_real=real_logits.mean(), D_logits_fake=fake_logits.mean()))
         return loss_dict
 
     def run(self):
@@ -461,17 +422,15 @@ class BaseTrainer:
 
     def log_grads(self):
         self.unwrap_model(self.D).eval().requires_grad_(False)
-        self.unwrap_model(self.D_sed).eval().requires_grad_(False)
         x = self.forward_generator()
         loss_l2 = F.mse_loss(x, self.batch_inputs.gt, reduction="mean") * self.config.lambda_l2
         loss_lpips = self.net_lpips(x, self.batch_inputs.gt).mean() * self.config.lambda_lpips
-        loss_disc = self.D(x, for_G=True).mean() * self.config.lambda_gan
-        x_256, gt_256, semantic = self._prepare_sed_inputs(x)
-        sed_logits = self.D_sed(x_256, semantic)
-        loss_sed = F.binary_cross_entropy_with_logits(
+        x_256, gt_256, semantic = self._prepare_D_inputs(x)
+        sed_logits = self.D(x_256, semantic)
+        loss_disc = F.binary_cross_entropy_with_logits(
             sed_logits, torch.ones_like(sed_logits)
-        ) * self.config.lambda_gan_sed
-        losses = [("l2", loss_l2), ("lpips", loss_lpips), ("disc", loss_disc), ("sed", loss_sed)]
+        ) * self.config.lambda_gan
+        losses = [("l2", loss_l2), ("lpips", loss_lpips), ("disc", loss_disc)]
         grad_dict = {}
         self.G_opt.zero_grad()
         for idx, (name, loss) in enumerate(losses):
